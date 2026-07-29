@@ -113,6 +113,7 @@ const SERVER_VERSION = "0.2.0";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_STATUS_WAIT_MS = 20_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
+const JOURNAL_CHUNK_BYTES = 64 * 1024;
 const POLL_INTERVAL_MS = 250;
 const runs = new Map();
 ```
@@ -477,9 +478,12 @@ Expected: FAIL because status has no journal events.
 - [ ] **Step 3: Consume journal additions once**
 
 Add `journalPath`, `journalOffset`, `journalTail`, and `pendingJournalEvents` to
-each run record. Import `open` from `node:fs/promises`.
+each run record, plus
+`journalDecoder: new TextDecoder("utf-8", { fatal: true })`. Import `open` from
+`node:fs/promises`.
 
-Read only bytes appended since `journalOffset`:
+Read only bytes appended since `journalOffset`, in bounded chunks. Advance the
+offset by the actual `bytesRead`, not the size observed by `stat()`:
 
 ```js
 async function readJournalAdditions(run) {
@@ -487,13 +491,30 @@ async function readJournalAdditions(run) {
   try {
     file = await open(run.journalPath, "r");
     const { size } = await file.stat();
-    if (size <= run.journalOffset) return [];
-    const chunk = Buffer.alloc(size - run.journalOffset);
-    await file.read(chunk, 0, chunk.length, run.journalOffset);
-    run.journalOffset = size;
-    const lines = `${run.journalTail}${chunk.toString("utf8")}`.split("\n");
-    run.journalTail = lines.pop();
-    return lines.filter(Boolean).map((line) => JSON.parse(line));
+    const lines = [];
+    while (run.journalOffset < size) {
+      const length = Math.min(
+        JOURNAL_CHUNK_BYTES,
+        size - run.journalOffset,
+      );
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await file.read(
+        chunk,
+        0,
+        length,
+        run.journalOffset,
+      );
+      if (bytesRead === 0) break;
+      run.journalOffset += bytesRead;
+      const decoded = run.journalDecoder.decode(
+        chunk.subarray(0, bytesRead),
+        { stream: true },
+      );
+      const additions = `${run.journalTail}${decoded}`.split("\n");
+      run.journalTail = additions.pop();
+      lines.push(...additions.filter(Boolean));
+    }
+    return lines.map((line) => JSON.parse(line));
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw new Error("Unable to read workflow journal");
@@ -541,10 +562,10 @@ transcript text in a returned error.
 
 - [ ] **Step 5: Turn journal lines into revisioned events**
 
-For `started`, create a leaf record and `leaf_started`. For `result`, close the
-same leaf and emit `leaf_completed` when `result !== null`, otherwise
-`leaf_failed`. Reuse Task 1's `appendEvent()` so each append increments
-`run.revision` exactly once:
+For `started`, create a leaf record and `leaf_started`. Native Claude 2.1.204
+does not append a journal `result` for a leaf whose result is `null`. For each
+observed `result`, close the same leaf and emit `leaf_completed`. Reuse Task
+1's `appendEvent()` so each append increments `run.revision` exactly once:
 
 ```js
 function appendEvent(run, event) {
@@ -557,12 +578,21 @@ Set `currentPhase` from the newest started leaf. A terminal native state calls
 `finishFromNativeState()`. Before the guarded terminal transition, that
 function performs one final `readJournalAdditions()` and processes those
 events, rechecking `run.terminal` after every awaited read and transcript
-parse. Only then does it call `finishRun()` with `completed`, `failed`, or
-`killed`; that single guarded path appends the matching terminal event and
-closes the child. Native ordering writes final journal results before terminal
-state, so this final drain cannot lose a completed/failed leaf.
+parse. It then flushes `journalDecoder`, parses one remaining non-empty
+`journalTail` as the final JSONL record, and treats invalid trailing bytes as a
+safe workflow failure. Only then does it call `finishRun()` with `completed`,
+`failed`, or `killed`; that single guarded path appends the matching terminal
+event and closes the child. Native ordering writes final journal results before
+terminal state, so this final drain cannot lose a completed/failed leaf.
 `snapshotRun()` returns only events whose revision is greater than
 `afterRevision`.
+
+Augment `finishRun()` with one synchronous `failOpenLeaves(run)` call before
+the terminal workflow event. It closes every still-active leaf, records its
+duration, and appends one `leaf_failed` event without any result payload.
+Because every terminal source uses `finishRun()`, native `null` leaves, stop,
+child exit, watcher failure, and shutdown all leave `counts.active === 0`.
+The guarded first caller still owns all leaf and workflow terminal events.
 
 - [ ] **Step 6: Implement heartbeat and timing fields**
 
@@ -593,7 +623,11 @@ Add tests with exact assertions:
   ignored and produces fallback metadata;
 - a valid first user record larger than 8 KiB still yields its tracked
   phase/role/label;
-- `result: null` produces one `leaf_failed` and `counts.failed === 1`;
+- a fake failed leaf writes only `started` (no journal `result`); terminal
+  cleanup produces one `leaf_failed`, `counts.failed === 1`, and no active
+  leaf;
+- a forced partial journal read and a UTF-8 code point split across two chunks
+  still produce every event exactly once;
 - a run with no journal/state returns `heartbeat: true` after `waitMs: 10`;
 - `WorkflowStop` emits `workflow_killed`, terminates the fake child, and is
   idempotent;

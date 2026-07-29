@@ -276,12 +276,21 @@ watcher:
 4. при terminal state ещё раз дочитывает journal и только после обработки
    финальных leaf events сохраняет result и закрывает native child.
 
+Journal читается фиксированными 64 KiB чанками. Offset продвигается только на
+фактический `bytesRead`, а потоковый UTF-8 decoder сохраняет незавершённый
+code point и неполную JSONL-строку для следующего чтения.
+
 После каждого асинхронного чтения watcher повторно проверяет terminal flag.
 Ошибки watcher и неожиданный exit child превращаются в безопасный
 `workflow_failed`, а не в unhandled rejection MCP server. Watcher не завершает
 workflow по времени. Отдельные 15-секундные таймауты остаются только у inner
 MCP handshake и launch request. При закрытии stdin внешнего MCP server все
 running children завершаются.
+
+Claude Code 2.1.204 не пишет journal `result` для leaf, вернувшего `null`.
+Поэтому единый terminal transition перед workflow-event закрывает все
+оставшиеся активные leaves как `leaf_failed`. Это же гарантирует нулевой
+`active` count после stop, child exit, watcher failure и shutdown.
 
 Пути journal и state всегда выводятся из валидированного native `scriptPath`.
 `WorkflowStatus` и `WorkflowStop` принимают только `runId`, а не путь.
@@ -318,6 +327,8 @@ running children завершаются.
 - Проверяются user-запись длиннее 8 KiB и terminal race, в котором финальный
   journal result появляется после обычного journal read, но до terminal
   transition; leaf event не теряется.
+- Проверяются частичный `file.read()`, UTF-8 code point на границе чанков и
+  native failed leaf без journal-result: ни байты, ни leaf events не теряются.
 - Существующие синхронные boundary-tests остаются зелёными.
 - Live GLM canary наблюдает два независимых prompt-based reviewer leaf, затем
   synthesis leaf и final non-empty result через асинхронный путь.
