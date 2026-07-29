@@ -636,11 +636,21 @@ configuration.
 Run:
 
 ```bash
-rg -n "WorkflowStatus|waitMs|heartbeat" scripts tests skills README.md .mcp.json .codex-plugin
+if rg -n "WorkflowStatus|waitMs|heartbeat" scripts skills README.md .mcp.json .codex-plugin
+then
+  exit 1
+fi
+if rg -n 'name: "WorkflowStatus"|\.heartbeat|heartbeat:' tests/mcp-boundary.test.mjs
+then
+  exit 1
+fi
+wait_ms_match_count=$(rg -n -c "waitMs" tests/mcp-boundary.test.mjs)
+test "$wait_ms_match_count" = "1"
 ```
 
-Expected: no matches. Do not modify historical files under
-`docs/superpowers/` or `.superpowers/sdd/`.
+Expected: the first two commands have no matches. The third prints `1` for the
+intentional unsupported-argument boundary case. Do not modify historical files
+under `docs/superpowers/` or `.superpowers/sdd/`.
 
 - [ ] **Step 6: Validate the skill, plugin, syntax, and non-canary suite**
 
@@ -702,14 +712,44 @@ After all three tasks and checks are complete:
    python3 /home/dirard/.codex/skills/.system/plugin-creator/scripts/read_marketplace_name.py
    ```
 
-5. Reinstall the versioned local plugin:
+   Expected: `personal`. Its source is the separate deployment directory
+   `/home/dirard/plugins/codex-dynamic-workflow-plugin`, not this Git checkout.
+
+5. Build and validate an exact archive of the reviewed commit, then replace
+   only the confirmed marketplace source:
+
+   ```bash
+   set -euo pipefail
+   reviewed_sha=$(git rev-parse HEAD)
+   deployment_root=$(mktemp -d /home/dirard/plugins/codex-dynamic-workflow-plugin.deploy.XXXXXX)
+   mkdir "$deployment_root/source"
+   git archive --format=tar --output="$deployment_root/plugin.tar" "$reviewed_sha"
+   tar -xf "$deployment_root/plugin.tar" -C "$deployment_root/source"
+   python3 /home/dirard/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py "$deployment_root/source"
+   node -e 'const m = require(process.argv[1]); if (m.version !== "0.3.0") process.exit(1)' "$deployment_root/source/.codex-plugin/plugin.json"
+   marketplace_source=/home/dirard/plugins/codex-dynamic-workflow-plugin
+   deployment_backup="${marketplace_source}.backup-$(date -u +%Y%m%d-%H%M%S)"
+   test -f "$marketplace_source/.codex-plugin/plugin.json"
+   test ! -e "$deployment_backup"
+   printf 'deployment backup: %s\n' "$deployment_backup"
+   mv "$marketplace_source" "$deployment_backup"
+   mv "$deployment_root/source" "$marketplace_source"
+   rm "$deployment_root/plugin.tar"
+   rmdir "$deployment_root"
+   ```
+
+   Expected: validation PASS, the new marketplace source contains manifest
+   version `0.3.0`, and the printed `deployment_backup` retains the old `0.2.0`
+   deployment. Recovery is moving that backup back to `marketplace_source`.
+
+6. Reinstall the versioned local plugin:
 
    ```bash
    codex plugin add codex-dynamic-workflow-plugin@personal
    ```
 
-6. Verify the installed cache contains version `0.3.0`, its `.mcp.json` has
+7. Verify the installed cache contains version `0.3.0`, its `.mcp.json` has
    `tool_timeout_sec: 31536000`, and its server publishes `WorkflowWait` but not
    `WorkflowStatus`.
-7. Test the newly installed MCP tools from a new Codex task, because the
+8. Test the newly installed MCP tools from a new Codex task, because the
    current task does not reload plugin tool definitions in place.
