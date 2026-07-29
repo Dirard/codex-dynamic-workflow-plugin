@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an asynchronous MCP lifecycle that lets Codex observe native Claude Workflow phases, prompt-based reviewer roles, and leaf progress without imposing an execution deadline.
+**Goal:** Add an asynchronous MCP lifecycle that lets Codex observe native Claude Workflow phases, general-purpose roles, and leaf progress without imposing an execution deadline, while preserving Claude Workflow as a universal orchestration surface.
 
-**Architecture:** Keep `claude mcp serve` as the only workflow runtime. `WorkflowStart` launches and registers a native run, a background watcher consumes the append-only native journal and terminal state, and `WorkflowStatus` returns revisioned phase/role/leaf events or a 20-second heartbeat. `WorkflowStop` provides explicit cancellation, while the existing synchronous `Workflow` delegates to the same run engine for compatibility. Reviewer types are concise prompt contracts inside the generated script, not custom Claude agents or a permission sandbox.
+**Architecture:** Keep `claude mcp serve` as the only workflow runtime. `WorkflowStart` launches and registers a native run, a background watcher consumes the append-only native journal and terminal state, and `WorkflowStatus` returns revisioned phase/role/leaf events or a 20-second heartbeat. `WorkflowStop` provides explicit cancellation, while the existing synchronous `Workflow` delegates to the same run engine for compatibility. The core skill links a comprehensive adaptation of Claude's native Workflow guidance; independent prompt-based reviewers are one optional recipe.
 
 **Tech Stack:** Node.js 20+ ESM and standard library only, JSON-RPC/MCP over stdio, native Claude Code 2.1.204 Dynamic Workflows, Node test runner.
 
@@ -17,7 +17,8 @@
 - Preserve the existing `Workflow({cwd, script, args?})` contract for callers that still need the synchronous path.
 - Status output must never expose credentials, provider responses, prompts, leaf results before terminal state, transcript paths, or native state paths.
 - Derive every journal/state path from a validated native `scriptPath`; status and stop inputs accept only a validated `runId`.
-- Provide prompt-based `product`, `correctness`, `security`, `tests`, `architecture`, `api-compatibility`, `performance`, `simplicity`, and `synthesis` role contracts.
+- Preserve general research, implementation, transformation, testing, synthesis, and custom DAG workflows; reviewer cycles must not become the default for unrelated tasks.
+- Provide optional prompt-based `product`, `correctness`, `security`, `tests`, `architecture`, `api-compatibility`, `performance`, `simplicity`, and `synthesis` role contracts.
 - Keep the existing Claude Code permissions warning: prompt-based read-only reviewers still receive native `Bash`, `Edit`, and `Write` tools; do not claim technical isolation.
 - Target plugin and MCP server version `0.2.0`.
 
@@ -25,7 +26,9 @@
 
 - Modify `scripts/workflow-mcp.mjs`: publish the four MCP tools, own the in-memory run registry, watch native journal/state, normalize safe snapshots, and preserve the synchronous adapter.
 - Modify `tests/mcp-boundary.test.mjs`: extend the fake Claude runtime, cover async lifecycle and progress events, and move the live GLM canary to the async tools.
-- Modify `skills/native-workflow/SKILL.md`: adapt Claude Workflow guidance for Codex, define tracked role-aware leaves and independent parallel review cycles, state the prompt-only read-only boundary, and require the start/status/heartbeat loop.
+- Modify `skills/native-workflow/SKILL.md`: keep the universal Codex orchestration loop, require the complete native guidance reference, define tracked role-aware leaves, and route review requests to the optional reviewer recipe.
+- Create `skills/native-workflow/references/claude-workflows.md`: adapt the complete Claude Code 2.1.204 Dynamic Workflow runtime guidance and mark plugin-specific deltas.
+- Create `skills/native-workflow/references/reviewer-roles.md`: define the optional independent parallel review-cycle and prompt-only read-only boundary.
 - Modify `skills/native-workflow/agents/openai.yaml`: describe the asynchronous MCP dependency.
 - Modify `README.md`: document observable progress, heartbeat, cancellation, and the absence of an execution deadline.
 - Modify `.codex-plugin/plugin.json`: publish version `0.2.0` and mention observable execution status.
@@ -542,6 +545,8 @@ git commit -m "feat: report native workflow progress"
 **Files:**
 - Modify: `skills/native-workflow/SKILL.md`
 - Modify: `skills/native-workflow/agents/openai.yaml`
+- Create: `skills/native-workflow/references/claude-workflows.md`
+- Create: `skills/native-workflow/references/reviewer-roles.md`
 - Modify: `tests/mcp-boundary.test.mjs`
 - Modify: `README.md`
 - Modify: `.codex-plugin/plugin.json`
@@ -551,8 +556,9 @@ git commit -m "feat: report native workflow progress"
 - Produces: an explicit Codex workflow:
   `WorkflowStart → WorkflowStatus(afterRevision, waitMs: 20000) → terminal`,
   plus `WorkflowStop` on cancellation.
-- Produces: tracked `leaf(phaseName, role, label, prompt, options?)` and a
-  prompt-based independent parallel review-cycle.
+- Produces: universal Claude Workflow scripting guidance, tracked
+  `leaf(phaseName, role, label, prompt, options?)`, and an optional prompt-based
+  independent parallel review-cycle.
 
 - [ ] **Step 1: Read the skill-writing instructions before editing the skill**
 
@@ -568,15 +574,56 @@ an existing skill update.
 
 - [ ] **Step 2: Record the no-skill baseline before editing**
 
-Give fresh agents the review-cycle and status-loop requests without access to
-`skills/native-workflow/SKILL.md`. Record whether they omit stable role
-metadata, use custom `agentType`, treat read-only as enforced, or miss the
+Give fresh agents both a general multi-stage workflow request and the optional
+review-cycle/status-loop request without access to
+`skills/native-workflow/SKILL.md`. Record whether they misuse
+`pipeline()`/`parallel()`, omit stable progress metadata, use unsupported
+`agentType`, treat prompt-based read-only as enforced, or miss the
 `WorkflowStart`/`WorkflowStatus` loop. These observed failures define the
-minimal guidance added in the next step.
+minimal guidance added next.
 
-- [ ] **Step 3: Adapt the native Claude Workflow guidance**
+- [ ] **Step 3: Create the complete adapted Claude Workflow reference**
 
-Update `skills/native-workflow/SKILL.md` to include:
+Create `skills/native-workflow/references/claude-workflows.md` from the bundled
+Claude Code 2.1.204 runtime guidance. `SKILL.md` will require reading this file
+before generating any workflow. Cover the universal API and behavior:
+
+- pure-literal `meta` with required `name`/`description`, optional
+  `whenToUse`/`phases`, and exact phase-title matching;
+- plain JavaScript in an async body;
+- `agent(prompt, {label, phase, schema, isolation})`, including structured
+  output and a possible `null` return;
+- `pipeline(items, ...stages)` as the default for independent per-item chains,
+  with `(previousResult, originalItem, index)` and failed items becoming
+  `null`;
+- `parallel(thunks)` as a barrier only when the next step needs all prior
+  results, with failed thunks becoming `null`;
+- `phase()`, `log()`, real JSON `args`, guarded `budget` loops, and optional
+  nested `workflow()` where the native registry is available;
+- deterministic scripts: no imports, Node/filesystem APIs, `Date.now()`,
+  argless `new Date()`, or `Math.random()`;
+- native limits: concurrent agents capped by the runtime, 1000 agents per run,
+  and 4096 items per `parallel()`/`pipeline()` call;
+- general compositions: fan-out/fan-in, map/reduce, multi-stage pipelines,
+  conditional branches, loop-until-count, loop-until-budget, loop-until-dry,
+  judge panels, adversarial verification, and completeness critics.
+
+Mark the plugin deltas explicitly:
+
+- Codex writes the exact DAG and passes the script inline;
+- omit `model`, `effort`, and custom `agentType` so leaf calls inherit
+  `glm-5.2` from the MCP session;
+- `isolation: "worktree"` is reserved for parallel mutating leaf agents, not
+  read-only review;
+- native resume through outer `scriptPath`/`resumeFromRunId` is not exposed by
+  the version 0.2.0 wrapper;
+- `log()` is diagnostic, while `WorkflowStatus` is the observable status
+  source.
+
+- [ ] **Step 4: Update the core skill and optional reviewer recipe**
+
+Update `skills/native-workflow/SKILL.md` to remain general-purpose, require
+`references/claude-workflows.md` for every invocation, and include:
 
 ```js
 function leaf(phaseName, role, label, prompt, options = {}) {
@@ -588,7 +635,9 @@ function leaf(phaseName, role, label, prompt, options = {}) {
 }
 ```
 
-Require:
+`role` may be any stable short identifier appropriate to the leaf; reviewer
+names are not required for research, implementation, migration, testing, or
+other workflows. Require:
 
 - pure-literal `meta` with exact matching `phases`;
 - `phase()` before each stage;
@@ -600,9 +649,10 @@ Require:
 - no imports, Node APIs, clocks, or randomness;
 - no `model` or custom `agentType`, so GLM-5.2 remains leaf-only.
 
-Add concise prompt contracts for `product`, `correctness`, `security`, `tests`,
-`architecture`, `api-compatibility`, `performance`, `simplicity`, and
-`synthesis`:
+Create `skills/native-workflow/references/reviewer-roles.md` as an optional
+recipe loaded only for independent review requests. Add concise prompt
+contracts for `product`, `correctness`, `security`, `tests`, `architecture`,
+`api-compatibility`, `performance`, `simplicity`, and `synthesis`:
 
 ```js
 const READ_ONLY_REVIEW =
@@ -656,7 +706,7 @@ Replace the synchronous execution section with the exact polling loop:
 7. Validate every terminal leaf output; only Codex chooses another workflow.
 ```
 
-- [ ] **Step 4: Update the live canary to use tracked leaves and async tools**
+- [ ] **Step 5: Update the live canary to use tracked leaves and async tools**
 
 Change `canaryScript` to define role-aware `leaf()`, add separate `Review` and
 `Synthesize` phases, and call all three agents through the helper.
@@ -675,7 +725,7 @@ The live test must:
 Do not add an elapsed-time stop condition to the plugin. The test harness may
 retain its 620-second request timeout so CI cannot hang forever.
 
-- [ ] **Step 5: Update metadata and user documentation**
+- [ ] **Step 6: Update metadata and user documentation**
 
 In `.codex-plugin/plugin.json` set `"version": "0.2.0"` and update
 `interface.longDescription` to mention observable phases and leaf status.
@@ -687,19 +737,24 @@ In `README.md`, document:
 
 - immediate `runId`;
 - phase/role/leaf updates and 20-second heartbeat;
-- the nine prompt-based reviewer roles and independent parallel review-cycle;
+- universal Claude Workflow guidance for arbitrary Codex-planned DAGs;
+- the nine prompt-based reviewer roles as an optional independent
+  parallel-review recipe;
 - prompt-based read-only intent is not a sandbox or permissions boundary;
 - explicit cancellation;
 - no total workflow deadline on the async path;
 - the legacy synchronous tool is compatibility-only;
 - the existing Claude permissions warning remains unchanged.
 
-- [ ] **Step 6: Forward-test and validate the skill**
+- [ ] **Step 7: Forward-test and validate the skill**
 
-Give a fresh agent the updated skill path and the same review-cycle request from
-Step 2. Confirm it selects relevant prepared roles, emits role-aware `leaf()`
-metadata, keeps reviewers independent, states the read-only limitation, and
-uses the asynchronous status loop.
+Give fresh agents the updated skill path and both requests from Step 2:
+
+- for a general multi-stage task, confirm correct native
+  `pipeline()`/`parallel()` selection, role-aware leaves, and the asynchronous
+  status loop without introducing reviewer roles;
+- for a review request, confirm relevant prepared roles, independent prompts,
+  the read-only limitation, and the same status loop.
 
 Run:
 
@@ -714,7 +769,7 @@ git diff --check
 Expected: syntax passes; all non-canary tests pass; both validators pass; diff
 check is clean.
 
-- [ ] **Step 7: Run the live GLM canary**
+- [ ] **Step 8: Run the live GLM canary**
 
 Run:
 
@@ -725,10 +780,10 @@ RUN_WORKFLOW_CANARY=1 node --test tests/mcp-boundary.test.mjs
 Expected: all tests pass, including observable parallel reviewer roles,
 Synthesis leaf, and terminal structured result.
 
-- [ ] **Step 8: Commit version 0.2.0**
+- [ ] **Step 9: Commit version 0.2.0**
 
 ```bash
-git add .codex-plugin/plugin.json README.md skills/native-workflow/SKILL.md skills/native-workflow/agents/openai.yaml tests/mcp-boundary.test.mjs
+git add .codex-plugin/plugin.json README.md skills/native-workflow/SKILL.md skills/native-workflow/agents/openai.yaml skills/native-workflow/references tests/mcp-boundary.test.mjs
 git commit -m "feat: teach Codex to monitor GLM workflows"
 ```
 
@@ -748,8 +803,8 @@ git commit -m "feat: teach Codex to monitor GLM workflows"
 
 - [ ] **Step 1: Run fresh release verification**
 
-Run the full commands from Task 3 Steps 5–6 again on the exact commit to be
-published. Also run:
+Run the validation and live canary commands from Task 3 Steps 7–8 again on the
+exact commit to be published. Also run:
 
 ```bash
 git status --short --branch
@@ -783,7 +838,8 @@ title `v0.2.0 — observable workflow progress`, and notes that mention:
 
 - immediate start with `runId`;
 - phase/role/leaf events and heartbeat;
-- nine prompt-based reviewer roles and independent review cycles;
+- comprehensive adapted Claude Workflow guidance for arbitrary DAGs;
+- nine prompt-based reviewer roles as an optional independent review recipe;
 - explicit notice that read-only reviewer behavior is prompt-based;
 - explicit stop;
 - no async execution deadline;
@@ -810,7 +866,8 @@ Expected: plugin validation passes with version `0.2.0`.
 Read the marketplace name with the plugin-creator helper, then run:
 
 ```bash
-codex plugin add codex-dynamic-workflow-plugin@personal --json
+plugin_marketplace_name=$(python3 "$CODEX_HOME/skills/.system/plugin-creator/scripts/read_marketplace_name.py")
+codex plugin add "codex-dynamic-workflow-plugin@$plugin_marketplace_name" --json
 codex plugin list
 ```
 

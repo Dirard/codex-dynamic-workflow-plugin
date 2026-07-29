@@ -3,8 +3,8 @@
 ## Цель
 
 Codex должен сразу получать идентификатор запущенного Claude Code Dynamic
-Workflow, видеть фактические переходы leaf-задач, включая специализированную
-роль, и регулярно сообщать пользователю, что работа продолжается. Большой
+Workflow, видеть фактические переходы leaf-задач, включая роль, когда она
+задана, и регулярно сообщать пользователю, что работа продолжается. Большой
 workflow не должен завершаться из-за общего временного лимита.
 
 Codex остаётся оркестратором: он строит DAG, формирует точный JavaScript,
@@ -170,9 +170,32 @@ agent transcript. Prompt, transcript, leaf result и filesystem paths не
 `label: "leaf-<id>"`, `phase: null` и `role: null`, не прерывая native
 workflow.
 
-## Prompt-based reviewer roles
+## Универсальные инструкции Claude Workflow
 
-Skill предоставляет девять готовых контрактов:
+Review-cycle — один из recipes, а не назначение плагина. Core skill остаётся
+универсальным и перед построением любого script требует прочитать bundled
+reference, адаптированный из инструкций Claude Code 2.1.204.
+
+Reference покрывает:
+
+- pure-literal `meta`, точные `phases` и plain JavaScript async body;
+- полные доступные hooks: `agent()`, `pipeline()`, `parallel()`, `log()`,
+  `phase()`, `args`, `budget` и вложенный `workflow()`;
+- JSON Schema structured output и обработку `null` leaf;
+- детерминизм, запрет Node.js/filesystem API, часов и randomness;
+- `pipeline()` как default и точные случаи, когда нужен barrier `parallel()`;
+- native concurrency/agent/item limits;
+- loops, fan-out/fan-in, map/reduce, judge panels, adversarial verification,
+  multi-modal sweep и loop-until-dry как composable examples;
+- различия плагина: script передаётся inline, Codex задаёт весь DAG,
+  `model`/`effort`/custom `agentType` не указываются, а resume by `scriptPath`
+  не публикуется MCP wrapper версии 0.2.0;
+- role-aware progress helper и асинхронный start/status/stop loop.
+
+## Optional prompt-based reviewer recipe
+
+Для независимого review-cycle skill дополнительно предоставляет девять готовых
+контрактов:
 
 - `product` — соответствие задаче и пользовательская ценность;
 - `correctness` — логика, состояния и граничные случаи;
@@ -192,7 +215,7 @@ native workflow, а leaf по-прежнему может видеть `Bash`, `
 Если нужна гарантированная изоляция, её обеспечивает окружение или permissions
 Claude Code вне плагина.
 
-Независимый review-cycle строится Codex:
+Когда пользователь выбирает review-cycle, его строит Codex:
 
 1. выбрать от пяти до восьми релевантных reviewer-ролей;
 2. дать каждому одинаковый исходный task context и отдельный role contract;
@@ -203,7 +226,7 @@ Claude Code вне плагина.
 6. только Codex проверяет findings, решает, что исправлять, и запускает ли новый
    цикл.
 
-## Адаптированные Claude Workflow instructions
+## Plugin-specific deltas
 
 Skill сохраняет нативную модель Claude Code 2.1.204 и изменяет только слой,
 необходимый Codex:
@@ -212,7 +235,9 @@ Skill сохраняет нативную модель Claude Code 2.1.204 и и
 - `meta` содержит `name`, `description` и `phases`;
 - названия в `meta.phases`, `phase()` и leaf `phase` совпадают точно;
 - каждый leaf имеет стабильные `role` и `label` и создаётся через `leaf()`;
-- reviewer roles остаются prompt-based; custom `agentType` не указывается;
+- `role` — любой стабильный короткий идентификатор; reviewer presets
+  опциональны;
+- custom `agentType` не указывается;
 - `parallel()` получает функции, а не готовые promises;
 - `pipeline()` используется для независимых стадий без лишнего barrier;
 - structured leaf возвращает объект через JSON Schema;
@@ -223,8 +248,9 @@ Skill сохраняет нативную модель Claude Code 2.1.204 и и
 - `log()` остаётся нативным диагностическим средством, но не считается
   источником live status.
 
-Инструкции адаптируются по смыслу, а не копируют внутренний system prompt
-Claude Code целиком.
+Bundled reference следует runtime guidance Claude section-by-section, но не
+копирует несвязанные части внутреннего system prompt и явно исключает
+возможности, которые MCP wrapper версии 0.2.0 не публикует.
 
 ## Внутренний lifecycle
 
