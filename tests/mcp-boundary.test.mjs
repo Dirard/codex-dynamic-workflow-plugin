@@ -7,7 +7,10 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import test from "node:test";
 
-const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url)).replace(
+  /[/\\]$/,
+  "",
+);
 const config = JSON.parse(
   await readFile(new URL("../.mcp.json", import.meta.url), "utf8"),
 );
@@ -78,6 +81,17 @@ function assertToolSuccess(result, name) {
   assert.notEqual(result.isError, true, `${name}: ${JSON.stringify(result)}`);
 }
 
+async function initialize(client) {
+  const initialized = await client.request("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
+  });
+  assert.equal(initialized.protocolVersion, "2025-06-18");
+  client.notify("notifications/initialized");
+  return initialized;
+}
+
 async function waitForFileText(path, expected, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -103,7 +117,8 @@ const path = require("node:path");
 const readline = require("node:readline");
 
 const runId = "wf_fixture";
-const stateRoot = process.env.FAKE_WORKFLOW_STATE_ROOT;
+const stateRoot =
+  process.env.FAKE_WORKFLOW_STATE_ROOT || path.join(path.dirname(process.argv[1]), "state");
 const marker = process.env.FAKE_WORKFLOW_MARKER;
 const respond = (id, result) => {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
@@ -132,7 +147,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method !== "tools/call") return;
 
   fs.mkdirSync(path.join(stateRoot, "scripts"), { recursive: true });
-  if (process.env.FAKE_WORKFLOW_NO_STATE !== "1") {
+  const delay = Number(process.env.FAKE_WORKFLOW_STATE_DELAY_MS || 0);
+  setTimeout(() => {
+    if (process.env.FAKE_WORKFLOW_NO_STATE === "1") return;
     fs.writeFileSync(
       path.join(stateRoot, runId + ".json"),
       JSON.stringify({
@@ -141,7 +158,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         result: { cwd: process.cwd() },
       }),
     );
-  }
+  }, delay);
   respond(message.id, {
     content: [{
       type: "text",
@@ -246,25 +263,25 @@ function startClient(env = {}) {
   };
 }
 
-test("configured MCP publishes the synchronous native Workflow tool", async (t) => {
+test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   const client = startClient();
   t.after(() => client.stop());
-
-  const initialized = await client.request("initialize", {
-    protocolVersion: "2025-06-18",
-    capabilities: {},
-    clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
-  });
-  assert.equal(initialized.protocolVersion, "2025-06-18");
-  client.notify("notifications/initialized");
+  await initialize(client);
 
   const { tools } = await client.request("tools/list", {});
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
-
-  assert.deepEqual(["Workflow"].filter((name) => !byName[name]), []);
-  assert.equal(byName.Workflow.inputSchema.properties.cwd.type, "string");
-  assert.equal(byName.Workflow.inputSchema.properties.script.type, "string");
-  assert.deepEqual(byName.Workflow.inputSchema.required, ["cwd", "script"]);
+  assert.deepEqual(Object.keys(byName).sort(), [
+    "Workflow",
+    "WorkflowStart",
+    "WorkflowStatus",
+    "WorkflowStop",
+  ]);
+  assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
+  assert.deepEqual(byName.WorkflowStatus.inputSchema.required, ["runId"]);
+  assert.equal(byName.WorkflowStatus.inputSchema.properties.afterRevision.default, 0);
+  assert.equal(byName.WorkflowStatus.inputSchema.properties.waitMs.default, 0);
+  assert.equal(byName.WorkflowStatus.inputSchema.properties.waitMs.maximum, 20_000);
+  assert.deepEqual(byName.WorkflowStop.inputSchema.required, ["runId"]);
 });
 
 test("Workflow refuses to fall back when Z.AI provider env is missing", async (t) => {
@@ -386,6 +403,81 @@ test("Workflow runs Claude in the requested workspace", async (t) => {
   });
   assertToolSuccess(result, "Workflow");
   assert.equal(parseToolPayload(result).result.cwd, workspace);
+});
+
+test("WorkflowStart returns before terminal state and WorkflowStatus returns the result", async (t) => {
+  const { fakeBin } = await createWorkflowClaude(t);
+  const client = startClient({
+    PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+    FAKE_WORKFLOW_STATE_DELAY_MS: "100",
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "placeholder",
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "async", description: "Async" };\nreturn { ok: true };',
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+  const launch = parseToolPayload(started);
+  assert.equal(launch.status, "starting");
+  assert.equal(launch.revision, 0);
+
+  const completed = await client.request("tools/call", {
+    name: "WorkflowStatus",
+    arguments: { runId: launch.runId, afterRevision: 0, waitMs: 1_000 },
+  });
+  assertToolSuccess(completed, "WorkflowStatus");
+  const snapshot = parseToolPayload(completed);
+  assert.equal(snapshot.status, "completed");
+  assert.equal(snapshot.result.cwd, repositoryRoot);
+});
+
+test("WorkflowStatus defaults return immediately", async (t) => {
+  const { fakeBin } = await createWorkflowClaude(t);
+  const client = startClient({
+    PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+    FAKE_WORKFLOW_STATE_DELAY_MS: "1000",
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "placeholder",
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "defaults", description: "Status defaults" };\nreturn { ok: true };',
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+  const { runId } = parseToolPayload(started);
+
+  const status = await client.request(
+    "tools/call",
+    { name: "WorkflowStatus", arguments: { runId } },
+    250,
+  );
+  assertToolSuccess(status, "WorkflowStatus");
+  const snapshot = parseToolPayload(status);
+  assert.equal(snapshot.status, "running");
+  assert.equal(snapshot.revision, 0);
+  assert.equal(snapshot.heartbeat, true);
+  assert.deepEqual(snapshot.events, []);
+
+  const stopped = await client.request("tools/call", {
+    name: "WorkflowStop",
+    arguments: { runId },
+  });
+  assertToolSuccess(stopped, "WorkflowStop");
 });
 
 test("Workflow reports a killed native run immediately", async (t) => {
