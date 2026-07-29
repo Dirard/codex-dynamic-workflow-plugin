@@ -1,0 +1,15 @@
+interface:
+  display_name: "Native Workflow"
+  short_description: "Запуск workflow, спланированных Codex"
+  default_prompt: "Use $codex-dynamic-workflow-plugin:native-workflow to execute this task as an exact Codex-planned workflow."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "claude-workflow"
+      description: "Bundled Claude Code Dynamic Workflow MCP server"
+      transport: "stdio"
+      command: "claude"
+
+policy:
+  allow_implicit_invocation: false
