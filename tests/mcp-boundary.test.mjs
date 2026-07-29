@@ -98,7 +98,7 @@ function assertToolSuccess(result, name) {
   assert.notEqual(result.isError, true, `${name}: ${JSON.stringify(result)}`);
 }
 
-async function pollWorkflowToTerminal(
+async function waitWorkflowToTerminal(
   client,
   launch,
   deadline,
@@ -112,16 +112,15 @@ async function pollWorkflowToTerminal(
     while (true) {
       const remaining = deadline - now();
       if (remaining <= 0) throw new Error("Live workflow canary timed out");
-      const waitMs = Math.min(20_000, remaining);
       const result = await client.request(
         "tools/call",
         {
-          name: "WorkflowStatus",
-          arguments: { runId: launch.runId, afterRevision, waitMs },
+          name: "WorkflowWait",
+          arguments: { runId: launch.runId, afterRevision },
         },
-        waitMs + 5_000,
+        remaining,
       );
-      assertToolSuccess(result, "WorkflowStatus");
+      assertToolSuccess(result, "WorkflowWait");
       const snapshot = parseToolPayload(result);
       events.push(...snapshot.events);
       afterRevision = snapshot.revision;
@@ -141,7 +140,7 @@ async function pollWorkflowToTerminal(
   }
 }
 
-test("canary polling uses each returned revision until terminal", async () => {
+test("canary waiting uses each returned revision until terminal", async () => {
   const calls = [];
   const snapshots = [
     {
@@ -165,7 +164,7 @@ test("canary polling uses each returned revision until terminal", async () => {
     },
   };
 
-  const completed = await pollWorkflowToTerminal(
+  const completed = await waitWorkflowToTerminal(
     client,
     { runId: "wf_canary", revision: 0 },
     40_000,
@@ -181,28 +180,26 @@ test("canary polling uses each returned revision until terminal", async () => {
     calls.map(({ params, timeout }) => ({ ...params, timeout })),
     [
       {
-        name: "WorkflowStatus",
+        name: "WorkflowWait",
         arguments: {
           runId: "wf_canary",
           afterRevision: 0,
-          waitMs: 20_000,
         },
-        timeout: 25_000,
+        timeout: 40_000,
       },
       {
-        name: "WorkflowStatus",
+        name: "WorkflowWait",
         arguments: {
           runId: "wf_canary",
           afterRevision: 2,
-          waitMs: 20_000,
         },
-        timeout: 25_000,
+        timeout: 40_000,
       },
     ],
   );
 });
 
-test("canary polling stops the run when its test deadline expires", async () => {
+test("canary waiting stops the run when its test deadline expires", async () => {
   const calls = [];
   const client = {
     async request(method, params, timeout) {
@@ -219,7 +216,7 @@ test("canary polling stops the run when its test deadline expires", async () => 
   };
 
   await assert.rejects(
-    pollWorkflowToTerminal(
+    waitWorkflowToTerminal(
       client,
       { runId: "wf_canary", revision: 0 },
       100,
@@ -637,21 +634,31 @@ function terminalWorkflowEvents(snapshot) {
   );
 }
 
+async function assertPending(promise) {
+  const settled = await Promise.race([
+    promise.then(
+      () => true,
+      () => true,
+    ),
+    new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+  ]);
+  assert.equal(settled, false);
+}
+
 async function collectWorkflowEvents(client, runId) {
   let afterRevision = 0;
   const events = [];
-  for (let attempt = 0; attempt < 6; attempt += 1) {
+  while (true) {
     const result = await client.request("tools/call", {
-      name: "WorkflowStatus",
-      arguments: { runId, afterRevision, waitMs: 500 },
+      name: "WorkflowWait",
+      arguments: { runId, afterRevision },
     });
-    assertToolSuccess(result, "WorkflowStatus");
+    assertToolSuccess(result, "WorkflowWait");
     const snapshot = parseToolPayload(result);
     events.push(...snapshot.events);
     afterRevision = snapshot.revision;
     if (snapshot.status !== "running") return { ...snapshot, events };
   }
-  throw new Error(`Workflow ${runId} did not reach terminal state`);
 }
 
 test("plugin starts its bundled native-workflow adapter", () => {
@@ -664,6 +671,7 @@ test("plugin starts its bundled native-workflow adapter", () => {
     "ANTHROPIC_BASE_URL",
     "XDG_CONFIG_HOME",
   ]);
+  assert.equal(server.tool_timeout_sec, 31_536_000);
 });
 
 function startClient(env = {}) {
@@ -749,14 +757,14 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   assert.deepEqual(Object.keys(byName).sort(), [
     "Workflow",
     "WorkflowStart",
-    "WorkflowStatus",
     "WorkflowStop",
+    "WorkflowWait",
   ]);
   assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
-  assert.deepEqual(byName.WorkflowStatus.inputSchema.required, ["runId"]);
-  assert.equal(byName.WorkflowStatus.inputSchema.properties.afterRevision.default, 0);
-  assert.equal(byName.WorkflowStatus.inputSchema.properties.waitMs.default, 0);
-  assert.equal(byName.WorkflowStatus.inputSchema.properties.waitMs.maximum, 20_000);
+  assert.deepEqual(byName.WorkflowWait.inputSchema.required, [
+    "runId",
+    "afterRevision",
+  ]);
   assert.deepEqual(byName.WorkflowStop.inputSchema.required, ["runId"]);
 });
 
@@ -881,7 +889,7 @@ test("Workflow runs Claude in the requested workspace", async (t) => {
   assert.equal(parseToolPayload(result).result.cwd, workspace);
 });
 
-test("WorkflowStart returns before terminal state and WorkflowStatus returns the result", async (t) => {
+test("WorkflowStart returns before terminal state and WorkflowWait returns the result", async (t) => {
   const { fakeBin } = await createWorkflowClaude(t);
   const client = startClient({
     PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
@@ -906,54 +914,13 @@ test("WorkflowStart returns before terminal state and WorkflowStatus returns the
   assert.equal(launch.revision, 0);
 
   const completed = await client.request("tools/call", {
-    name: "WorkflowStatus",
-    arguments: { runId: launch.runId, afterRevision: 0, waitMs: 1_000 },
+    name: "WorkflowWait",
+    arguments: { runId: launch.runId, afterRevision: 0 },
   });
-  assertToolSuccess(completed, "WorkflowStatus");
+  assertToolSuccess(completed, "WorkflowWait");
   const snapshot = parseToolPayload(completed);
   assert.equal(snapshot.status, "completed");
   assert.equal(snapshot.result.cwd, repositoryRoot);
-});
-
-test("WorkflowStatus defaults return immediately", async (t) => {
-  const { fakeBin } = await createWorkflowClaude(t);
-  const client = startClient({
-    PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
-    FAKE_WORKFLOW_STATE_DELAY_MS: "1000",
-    ANTHROPIC_BASE_URL: "https://example.invalid",
-    ANTHROPIC_AUTH_TOKEN: "placeholder",
-  });
-  t.after(() => client.stop());
-  await initialize(client);
-
-  const started = await client.request("tools/call", {
-    name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "defaults", description: "Status defaults" };\nreturn { ok: true };',
-    },
-  });
-  assertToolSuccess(started, "WorkflowStart");
-  const { runId } = parseToolPayload(started);
-
-  const status = await client.request(
-    "tools/call",
-    { name: "WorkflowStatus", arguments: { runId } },
-    250,
-  );
-  assertToolSuccess(status, "WorkflowStatus");
-  const snapshot = parseToolPayload(status);
-  assert.equal(snapshot.status, "running");
-  assert.equal(snapshot.revision, 0);
-  assert.equal(snapshot.heartbeat, true);
-  assert.deepEqual(snapshot.events, []);
-
-  const stopped = await client.request("tools/call", {
-    name: "WorkflowStop",
-    arguments: { runId },
-  });
-  assertToolSuccess(stopped, "WorkflowStop");
 });
 
 test("Workflow reports a killed native run immediately", async (t) => {
@@ -1037,14 +1004,14 @@ test("closing adapter input terminates an active Claude workflow", async (t) => 
   await waitForFileText(marker, "terminated");
 });
 
-test("WorkflowStatus reports revisioned leaf progress without transcript data", async (t) => {
+test("WorkflowWait reports revisioned leaf progress without transcript data", async (t) => {
   const { client, stateRoot } = await startFakeProgressClient(t);
   const launch = await startFakeWorkflow(client);
 
   const running = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowStatus",
-      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 1_000 },
+      name: "WorkflowWait",
+      arguments: { runId: launch.runId, afterRevision: 0 },
     }),
   );
   assert.equal(running.events[0].type, "leaf_started");
@@ -1052,6 +1019,7 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
   assert.equal(running.events[0].role, "correctness");
   assert.equal(running.events[0].label, "inspect-readme");
   assert.equal(running.counts.active, 1);
+  assert.equal("heartbeat" in running, false);
 
   const serialized = JSON.stringify(running);
   assert.doesNotMatch(serialized, /SECRET_PROMPT_TEXT|SECRET_LEAF_RESULT/);
@@ -1060,11 +1028,10 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
   await writeFile(join(stateRoot, `${launch.runId}.release-result`), "");
   const leafCompleted = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowStatus",
+      name: "WorkflowWait",
       arguments: {
         runId: launch.runId,
         afterRevision: running.revision,
-        waitMs: 1_000,
       },
     }),
   );
@@ -1087,11 +1054,10 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
   await writeFile(join(stateRoot, `${launch.runId}.release-state`), "");
   const terminal = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowStatus",
+      name: "WorkflowWait",
       arguments: {
         runId: launch.runId,
         afterRevision: leafCompleted.revision,
-        waitMs: 1_000,
       },
     }),
   );
@@ -1100,7 +1066,7 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
   assert.ok(terminal.revision > leafCompleted.revision);
 });
 
-test("WorkflowStatus waits for a complete first user record before emitting leaf progress", async (t) => {
+test("WorkflowWait stays pending until a complete first user record emits progress", async (t) => {
   const gate = await createWatcherGate(t, "after-journal");
   const { client, stateRoot } = await startFakeModeClient(
     t,
@@ -1110,15 +1076,15 @@ test("WorkflowStatus waits for a complete first user record before emitting leaf
   const launch = await startFakeWorkflow(client);
   await waitForFileText(gate.ready, "ready");
 
-  const waiting = parseToolPayload(
-    await client.request("tools/call", {
-      name: "WorkflowStatus",
-      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 10 },
-    }),
+  const waiting = client.request(
+    "tools/call",
+    {
+      name: "WorkflowWait",
+      arguments: { runId: launch.runId, afterRevision: 0 },
+    },
+    2_000,
   );
-  assert.equal(waiting.revision, 0);
-  assert.equal(waiting.heartbeat, true);
-  assert.deepEqual(waiting.events, []);
+  await assertPending(waiting);
 
   await writeFile(
     fakeTranscriptPath(stateRoot, launch.runId),
@@ -1149,6 +1115,8 @@ test("WorkflowStatus waits for a complete first user record before emitting leaf
   );
   await writeFile(gate.release, "");
 
+  const first = parseToolPayload(await waiting);
+  assert.ok(first.revision > 0);
   const snapshot = await collectWorkflowEvents(client, launch.runId);
   assert.equal(snapshot.status, "completed");
   assert.deepEqual(
@@ -1180,15 +1148,15 @@ test("terminal drain forces fallback for a permanently missing progress transcri
   const launch = await startFakeWorkflow(client);
   await waitForFileText(gate.ready, "ready");
 
-  const waiting = parseToolPayload(
-    await client.request("tools/call", {
-      name: "WorkflowStatus",
-      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 10 },
-    }),
+  const waiting = client.request(
+    "tools/call",
+    {
+      name: "WorkflowWait",
+      arguments: { runId: launch.runId, afterRevision: 0 },
+    },
+    2_000,
   );
-  assert.equal(waiting.revision, 0);
-  assert.equal(waiting.heartbeat, true);
-  assert.deepEqual(waiting.events, []);
+  await assertPending(waiting);
 
   await writeFile(
     join(stateRoot, `${launch.runId}.json`),
@@ -1200,6 +1168,8 @@ test("terminal drain forces fallback for a permanently missing progress transcri
   );
   await writeFile(gate.release, "");
 
+  const first = parseToolPayload(await waiting);
+  assert.ok(first.revision > 0);
   const snapshot = await collectWorkflowEvents(client, launch.runId);
   assert.equal(snapshot.status, "completed");
   assert.deepEqual(
@@ -1217,7 +1187,7 @@ test("terminal drain forces fallback for a permanently missing progress transcri
   assert.equal(snapshot.counts.failed, 1);
 });
 
-test("WorkflowStatus rejects unknown runs and invalid polling arguments safely", async (t) => {
+test("WorkflowWait rejects unknown runs and invalid revision arguments safely", async (t) => {
   const client = startClient({
     ANTHROPIC_BASE_URL: "https://example.invalid",
     ANTHROPIC_AUTH_TOKEN: "placeholder",
@@ -1227,8 +1197,12 @@ test("WorkflowStatus rejects unknown runs and invalid polling arguments safely",
 
   const cases = [
     {
-      arguments: { runId: "wf_missing" },
+      arguments: { runId: "wf_missing", afterRevision: 0 },
       expected: /Unknown workflow run/,
+    },
+    {
+      arguments: { runId: "wf_missing" },
+      expected: /afterRevision must be a non-negative integer/,
     },
     {
       arguments: { runId: "wf_missing", afterRevision: -1 },
@@ -1239,22 +1213,14 @@ test("WorkflowStatus rejects unknown runs and invalid polling arguments safely",
       expected: /afterRevision must be a non-negative integer/,
     },
     {
-      arguments: { runId: "wf_missing", waitMs: -1 },
-      expected: /waitMs must be an integer between 0 and 20000/,
-    },
-    {
-      arguments: { runId: "wf_missing", waitMs: 20_001 },
-      expected: /waitMs must be an integer between 0 and 20000/,
-    },
-    {
-      arguments: { runId: "wf_missing", waitMs: 1.5 },
-      expected: /waitMs must be an integer between 0 and 20000/,
+      arguments: { runId: "wf_missing", afterRevision: 0, waitMs: 1 },
+      expected: /unsupported argument/,
     },
   ];
 
   for (const item of cases) {
     const result = await client.request("tools/call", {
-      name: "WorkflowStatus",
+      name: "WorkflowWait",
       arguments: item.arguments,
     });
     assert.equal(result.isError, true);
@@ -1264,6 +1230,19 @@ test("WorkflowStatus rejects unknown runs and invalid polling arguments safely",
       /subagents|journal\\.jsonl|SECRET_/,
     );
   }
+
+  const { client: runningClient } = await startFakeModeClient(t, "no-state");
+  const launch = await startFakeWorkflow(runningClient);
+  const future = await runningClient.request("tools/call", {
+    name: "WorkflowWait",
+    arguments: { runId: launch.runId, afterRevision: launch.revision + 1 },
+  });
+  assert.equal(future.isError, true);
+  assert.match(future.content[0].text, /cannot exceed current revision/);
+  await runningClient.request("tools/call", {
+    name: "WorkflowStop",
+    arguments: { runId: launch.runId },
+  });
 });
 
 test("unsafe journal agent ids fail without reading outside the transcript root", async (t) => {
@@ -1379,25 +1358,31 @@ test("bounded journal reads preserve split UTF-8 and emit each event once", asyn
   await waitForFileText(markerPath, "partial");
 });
 
-test("WorkflowStatus returns a heartbeat when no journal or state changes", async (t) => {
+test("WorkflowWait stays pending until WorkflowStop advances the revision", async (t) => {
   const { client } = await startFakeModeClient(t, "no-state");
   const launch = await startFakeWorkflow(client);
-  const snapshot = parseToolPayload(
-    await client.request("tools/call", {
-      name: "WorkflowStatus",
-      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 10 },
-    }),
+  const waiting = client.request(
+    "tools/call",
+    {
+      name: "WorkflowWait",
+      arguments: { runId: launch.runId, afterRevision: 0 },
+    },
+    2_000,
   );
 
-  assert.equal(snapshot.status, "running");
-  assert.equal(snapshot.revision, 0);
-  assert.equal(snapshot.heartbeat, true);
-  assert.deepEqual(snapshot.events, []);
+  await assertPending(waiting);
+  const stopped = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStop",
+      arguments: { runId: launch.runId },
+    }),
+  );
+  const snapshot = parseToolPayload(await waiting);
 
-  await client.request("tools/call", {
-    name: "WorkflowStop",
-    arguments: { runId: launch.runId },
-  });
+  assert.equal(stopped.status, "killed");
+  assert.equal(snapshot.status, "killed");
+  assert.equal(snapshot.events.at(-1).type, "workflow_killed");
+  assert.equal("heartbeat" in snapshot, false);
 });
 
 test("WorkflowStop emits workflow_killed, terminates Claude, and is idempotent", async (t) => {
@@ -1494,8 +1479,8 @@ test("WorkflowStop wins over an already-read native terminal state", async (t) =
 
   const snapshot = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowStatus",
-      arguments: { runId: launch.runId },
+      name: "WorkflowWait",
+      arguments: { runId: launch.runId, afterRevision: 0 },
     }),
   );
   assert.equal(snapshot.status, "killed");
@@ -1587,7 +1572,7 @@ test(
     });
     assertToolSuccess(started, "WorkflowStart");
     const launch = parseToolPayload(started);
-    const completed = await pollWorkflowToTerminal(
+    const completed = await waitWorkflowToTerminal(
       client,
       launch,
       deadline,
