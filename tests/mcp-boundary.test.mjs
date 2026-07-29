@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import test from "node:test";
@@ -109,6 +117,7 @@ async function createWorkflowClaude(t) {
   const fakeBin = await mkdtemp(join(tmpdir(), "codex-workflow-mcp-"));
   const stateRoot = join(fakeBin, "state");
   const fakeClaude = join(fakeBin, "claude");
+  await mkdir(stateRoot, { recursive: true });
   await writeFile(
     fakeClaude,
     `#!/usr/bin/env node
@@ -116,21 +125,111 @@ const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
 
-const runId = "wf_fixture";
 const stateRoot =
   process.env.FAKE_WORKFLOW_STATE_ROOT || path.join(path.dirname(process.argv[1]), "state");
-const marker = process.env.FAKE_WORKFLOW_MARKER;
+const runId =
+  process.env.FAKE_WORKFLOW_UNIQUE_RUNS === "1"
+    ? "wf_child-" + process.pid
+    : "wf_fixture";
+const lifecyclePath =
+  process.env.FAKE_WORKFLOW_MARKER ||
+  (process.env.FAKE_WORKFLOW_MARKER_ROOT
+    ? path.join(process.env.FAKE_WORKFLOW_MARKER_ROOT, runId)
+    : null);
+const statePath = path.join(stateRoot, runId + ".json");
+const transcriptRoot = path.join(
+  path.dirname(stateRoot),
+  "subagents",
+  "workflows",
+  runId,
+);
+const journalPath = path.join(transcriptRoot, "journal.jsonl");
 const respond = (id, result) => {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
 };
 
-if (marker) {
-  fs.mkdirSync(path.dirname(marker), { recursive: true });
-  fs.writeFileSync(marker, "running");
+if (lifecyclePath) {
+  fs.mkdirSync(path.dirname(lifecyclePath), { recursive: true });
+  fs.writeFileSync(lifecyclePath, "running");
   process.once("SIGTERM", () => {
-    fs.writeFileSync(marker, "terminated");
+    fs.writeFileSync(lifecyclePath, "terminated");
     process.exit(0);
   });
+}
+
+function readMode() {
+  const modePath = path.join(stateRoot, "mode");
+  if (fs.existsSync(modePath)) return fs.readFileSync(modePath, "utf8").trim();
+  return process.env.FAKE_WORKFLOW_MODE || "complete";
+}
+
+function resetRunFiles() {
+  fs.rmSync(statePath, { force: true });
+  fs.rmSync(transcriptRoot, { recursive: true, force: true });
+  fs.mkdirSync(transcriptRoot, { recursive: true });
+  fs.mkdirSync(path.join(stateRoot, "scripts"), { recursive: true });
+}
+
+function writeState(status = "completed") {
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      runId,
+      status,
+      result: { cwd: process.cwd() },
+    }),
+  );
+}
+
+function markerText() {
+  return (
+    '<codex-workflow-progress>{"phase":"Inspect","role":"correctness",' +
+    '"label":"inspect-readme"}</codex-workflow-progress>'
+  );
+}
+
+function writeTranscript(mode, agentId) {
+  if (mode === "invalid-agent") return;
+  let records;
+  if (mode === "later-marker") {
+    records = [
+      {
+        type: "user",
+        message: { role: "user", content: "No progress metadata here" },
+      },
+      {
+        type: "assistant",
+        message: { role: "assistant", content: markerText() },
+      },
+      {
+        type: "tool",
+        message: { role: "tool", content: markerText() },
+      },
+    ];
+  } else {
+    const prefix = mode === "large-user" ? "x".repeat(9 * 1024) : "";
+    records = [
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: prefix + markerText() + "\\nSECRET_PROMPT_TEXT",
+        },
+      },
+    ];
+  }
+  fs.writeFileSync(
+    path.join(transcriptRoot, "agent-" + agentId + ".jsonl"),
+    records.map((record) => JSON.stringify(record)).join("\\n") + "\\n",
+  );
+}
+
+function appendJournal(value) {
+  fs.appendFileSync(journalPath, JSON.stringify(value) + "\\n");
+}
+
+function scheduleState(status, delay = 50) {
+  setTimeout(() => writeState(status), delay);
 }
 
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
@@ -146,19 +245,78 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (message.method !== "tools/call") return;
 
-  fs.mkdirSync(path.join(stateRoot, "scripts"), { recursive: true });
-  const delay = Number(process.env.FAKE_WORKFLOW_STATE_DELAY_MS || 0);
-  setTimeout(() => {
-    if (process.env.FAKE_WORKFLOW_NO_STATE === "1") return;
+  resetRunFiles();
+  const mode =
+    process.env.FAKE_WORKFLOW_PROGRESS === "1" ? "progress" : readMode();
+  const agentId = process.env.FAKE_WORKFLOW_AGENT_ID || "agentone";
+
+  if (
+    [
+      "progress",
+      "terminal-drain",
+      "failed-leaf",
+      "later-marker",
+      "large-user",
+      "invalid-agent",
+      "split-journal",
+    ].includes(mode)
+  ) {
+    writeTranscript(mode, agentId);
+  }
+
+  if (mode === "split-journal") {
+    const prefix =
+      '{"type":"started","agentId":"' + agentId + '","padding":"';
+    const paddingLength = 65_535 - Buffer.byteLength(prefix);
+    const firstLine =
+      prefix + "a".repeat(paddingLength) + "é" + '"}\\n';
     fs.writeFileSync(
-      path.join(stateRoot, runId + ".json"),
-      JSON.stringify({
-        runId,
-        status: process.env.FAKE_WORKFLOW_STATUS || "completed",
-        result: { cwd: process.cwd() },
-      }),
+      journalPath,
+      firstLine +
+        JSON.stringify({
+          type: "result",
+          agentId,
+          result: "SECRET_LEAF_RESULT",
+        }) +
+        "\\n",
     );
-  }, delay);
+    scheduleState("completed");
+  } else if (mode === "malformed-journal") {
+    fs.writeFileSync(journalPath, '{"type":\\n');
+  } else if (
+    [
+      "progress",
+      "terminal-drain",
+      "failed-leaf",
+      "later-marker",
+      "large-user",
+      "invalid-agent",
+    ].includes(mode)
+  ) {
+    appendJournal({ type: "started", agentId });
+    if (mode === "failed-leaf") scheduleState("failed");
+    if (["later-marker", "large-user", "invalid-agent"].includes(mode)) {
+      appendJournal({
+        type: "result",
+        agentId,
+        result: "SECRET_LEAF_RESULT",
+      });
+      scheduleState("completed");
+    }
+  } else if (mode === "malformed-state") {
+    fs.writeFileSync(statePath, "{");
+  } else if (mode === "exit") {
+    setTimeout(() => process.exit(23), 20);
+  } else if (
+    mode !== "no-state" &&
+    process.env.FAKE_WORKFLOW_NO_STATE !== "1"
+  ) {
+    scheduleState(
+      process.env.FAKE_WORKFLOW_STATUS || "completed",
+      Number(process.env.FAKE_WORKFLOW_STATE_DELAY_MS || 0),
+    );
+  }
+
   respond(message.id, {
     content: [{
       type: "text",
@@ -170,12 +328,161 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }],
     isError: false,
   });
+
+  if (mode === "progress") {
+    let resultWritten = false;
+    const timer = setInterval(() => {
+      if (
+        !resultWritten &&
+        fs.existsSync(path.join(stateRoot, runId + ".release-result"))
+      ) {
+        appendJournal({
+          type: "result",
+          agentId,
+          result: "SECRET_LEAF_RESULT",
+        });
+        resultWritten = true;
+      }
+      if (
+        resultWritten &&
+        fs.existsSync(path.join(stateRoot, runId + ".release-state"))
+      ) {
+        clearInterval(timer);
+        writeState("completed");
+      }
+    }, 5);
+  }
 });
 `,
   );
   await chmod(fakeClaude, 0o755);
   t.after(() => rm(fakeBin, { recursive: true, force: true }));
   return { fakeBin, stateRoot };
+}
+
+async function setFakeWorkflowMode(stateRoot, mode) {
+  await writeFile(join(stateRoot, "mode"), mode);
+}
+
+async function startFakeWorkflow(client) {
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "progress", description: "Progress" };\nreturn { ok: true };',
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+  return parseToolPayload(started);
+}
+
+async function startFakeProgressClient(t, env = {}) {
+  const { fakeBin, stateRoot } = await createWorkflowClaude(t);
+  const client = startClient({
+    PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+    FAKE_WORKFLOW_STATE_ROOT: stateRoot,
+    FAKE_WORKFLOW_PROGRESS: "1",
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "placeholder",
+    ...env,
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+  return { client, stateRoot };
+}
+
+async function startFakeModeClient(t, mode, env = {}) {
+  const { fakeBin, stateRoot } = await createWorkflowClaude(t);
+  await setFakeWorkflowMode(stateRoot, mode);
+  const client = startClient({
+    PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+    FAKE_WORKFLOW_STATE_ROOT: stateRoot,
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "placeholder",
+    ...env,
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+  return { client, stateRoot };
+}
+
+function fakeJournalPath(stateRoot, runId) {
+  return join(
+    dirname(stateRoot),
+    "subagents",
+    "workflows",
+    runId,
+    "journal.jsonl",
+  );
+}
+
+async function createWatcherGate(t, point, runId = "wf_fixture") {
+  const gateDir = await mkdtemp(join(tmpdir(), "codex-workflow-gate-"));
+  t.after(() => rm(gateDir, { recursive: true, force: true }));
+  await writeFile(join(gateDir, `${runId}.${point}.block`), "");
+  return {
+    gateDir,
+    ready: join(gateDir, `${runId}.${point}.ready`),
+    release: join(gateDir, `${runId}.${point}.release`),
+  };
+}
+
+async function createPartialReadHook(t) {
+  const hookRoot = await mkdtemp(join(tmpdir(), "codex-workflow-read-hook-"));
+  const hookPath = join(hookRoot, "partial-read.mjs");
+  const markerPath = join(hookRoot, "partial-read-observed");
+  t.after(() => rm(hookRoot, { recursive: true, force: true }));
+  await writeFile(
+    hookPath,
+    `import { open } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
+const probe = await open(new URL(import.meta.url));
+const fileHandlePrototype = Object.getPrototypeOf(probe);
+await probe.close();
+const originalRead = fileHandlePrototype.read;
+fileHandlePrototype.read = async function (buffer, offset, length, position) {
+  const limitedLength = Math.min(length, 32 * 1024);
+  const result = await originalRead.call(
+    this,
+    buffer,
+    offset,
+    limitedLength,
+    position,
+  );
+  if (limitedLength < length && result.bytesRead === limitedLength) {
+    writeFileSync(${JSON.stringify(markerPath)}, "partial");
+  }
+  return result;
+};
+`,
+  );
+  return { hookPath, markerPath };
+}
+
+function terminalWorkflowEvents(snapshot) {
+  return snapshot.events.filter((event) =>
+    ["workflow_completed", "workflow_failed", "workflow_killed"].includes(
+      event.type,
+    ),
+  );
+}
+
+async function collectWorkflowEvents(client, runId) {
+  let afterRevision = 0;
+  const events = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const result = await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: { runId, afterRevision, waitMs: 500 },
+    });
+    assertToolSuccess(result, "WorkflowStatus");
+    const snapshot = parseToolPayload(result);
+    events.push(...snapshot.events);
+    afterRevision = snapshot.revision;
+    if (snapshot.status !== "running") return { ...snapshot, events };
+  }
+  throw new Error(`Workflow ${runId} did not reach terminal state`);
 }
 
 test("plugin starts its bundled native-workflow adapter", () => {
@@ -559,6 +866,424 @@ test("closing adapter input terminates an active Claude workflow", async (t) => 
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Claude Code stopped/);
   await waitForFileText(marker, "terminated");
+});
+
+test("WorkflowStatus reports revisioned leaf progress without transcript data", async (t) => {
+  const { client, stateRoot } = await startFakeProgressClient(t);
+  const launch = await startFakeWorkflow(client);
+
+  const running = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 1_000 },
+    }),
+  );
+  assert.equal(running.events[0].type, "leaf_started");
+  assert.equal(running.events[0].phase, "Inspect");
+  assert.equal(running.events[0].role, "correctness");
+  assert.equal(running.events[0].label, "inspect-readme");
+  assert.equal(running.counts.active, 1);
+
+  const serialized = JSON.stringify(running);
+  assert.doesNotMatch(serialized, /SECRET_PROMPT_TEXT|SECRET_LEAF_RESULT/);
+  assert.doesNotMatch(serialized, /subagents|journal\\.jsonl|agent-agentone/);
+
+  await writeFile(join(stateRoot, `${launch.runId}.release-result`), "");
+  const leafCompleted = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: {
+        runId: launch.runId,
+        afterRevision: running.revision,
+        waitMs: 1_000,
+      },
+    }),
+  );
+  assert.ok(
+    leafCompleted.events.some((event) => event.type === "leaf_completed"),
+  );
+  assert.equal(leafCompleted.status, "running");
+  assert.equal(leafCompleted.counts.active, 0);
+  assert.equal(leafCompleted.counts.completed, 1);
+  const completedSerialized = JSON.stringify(leafCompleted);
+  assert.doesNotMatch(
+    completedSerialized,
+    /SECRET_PROMPT_TEXT|SECRET_LEAF_RESULT/,
+  );
+  assert.doesNotMatch(
+    completedSerialized,
+    /subagents|journal\\.jsonl|agent-agentone/,
+  );
+
+  await writeFile(join(stateRoot, `${launch.runId}.release-state`), "");
+  const terminal = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: {
+        runId: launch.runId,
+        afterRevision: leafCompleted.revision,
+        waitMs: 1_000,
+      },
+    }),
+  );
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.events[0].type, "workflow_completed");
+  assert.ok(terminal.revision > leafCompleted.revision);
+});
+
+test("WorkflowStatus rejects unknown runs and invalid polling arguments safely", async (t) => {
+  const client = startClient({
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "placeholder",
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+
+  const cases = [
+    {
+      arguments: { runId: "wf_missing" },
+      expected: /Unknown workflow run/,
+    },
+    {
+      arguments: { runId: "wf_missing", afterRevision: -1 },
+      expected: /afterRevision must be a non-negative integer/,
+    },
+    {
+      arguments: { runId: "wf_missing", afterRevision: 1.5 },
+      expected: /afterRevision must be a non-negative integer/,
+    },
+    {
+      arguments: { runId: "wf_missing", waitMs: -1 },
+      expected: /waitMs must be an integer between 0 and 20000/,
+    },
+    {
+      arguments: { runId: "wf_missing", waitMs: 20_001 },
+      expected: /waitMs must be an integer between 0 and 20000/,
+    },
+    {
+      arguments: { runId: "wf_missing", waitMs: 1.5 },
+      expected: /waitMs must be an integer between 0 and 20000/,
+    },
+  ];
+
+  for (const item of cases) {
+    const result = await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: item.arguments,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, item.expected);
+    assert.doesNotMatch(
+      result.content[0].text,
+      /subagents|journal\\.jsonl|SECRET_/,
+    );
+  }
+});
+
+test("unsafe journal agent ids fail without reading outside the transcript root", async (t) => {
+  for (const agentId of [
+    "x/../../../../outside",
+    "bad/name",
+    "bad\\\\name",
+  ]) {
+    await t.test(agentId, async (subtest) => {
+      const { client, stateRoot } = await startFakeModeClient(
+        subtest,
+        "invalid-agent",
+        { FAKE_WORKFLOW_AGENT_ID: agentId },
+      );
+      await writeFile(
+        join(dirname(stateRoot), "outside.jsonl"),
+        `${JSON.stringify({
+          type: "user",
+          message: {
+            role: "user",
+            content:
+              '<codex-workflow-progress>{"phase":"SECRET_OUTSIDE_TRANSCRIPT","role":"secret","label":"secret"}</codex-workflow-progress>',
+          },
+        })}\n`,
+      );
+
+      const launch = await startFakeWorkflow(client);
+      const snapshot = await collectWorkflowEvents(client, launch.runId);
+      assert.equal(snapshot.status, "failed");
+      assert.equal(terminalWorkflowEvents(snapshot).length, 1);
+      assert.equal(
+        terminalWorkflowEvents(snapshot)[0].type,
+        "workflow_failed",
+      );
+      assert.doesNotMatch(
+        JSON.stringify(snapshot),
+        /SECRET_OUTSIDE_TRANSCRIPT|outside\\.jsonl|subagents/,
+      );
+    });
+  }
+});
+
+test("progress metadata in later assistant or tool records is ignored", async (t) => {
+  const { client } = await startFakeModeClient(t, "later-marker");
+  const launch = await startFakeWorkflow(client);
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  const started = snapshot.events.find((event) => event.type === "leaf_started");
+
+  assert.equal(snapshot.status, "completed");
+  assert.equal(started.phase, null);
+  assert.equal(started.role, null);
+  assert.equal(started.label, "leaf-agentone");
+});
+
+test("progress metadata survives a first user record larger than 8 KiB", async (t) => {
+  const { client } = await startFakeModeClient(t, "large-user");
+  const launch = await startFakeWorkflow(client);
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  const started = snapshot.events.find((event) => event.type === "leaf_started");
+
+  assert.equal(snapshot.status, "completed");
+  assert.equal(started.phase, "Inspect");
+  assert.equal(started.role, "correctness");
+  assert.equal(started.label, "inspect-readme");
+});
+
+test("terminal cleanup reports a started leaf without a result as failed", async (t) => {
+  const { client } = await startFakeModeClient(t, "failed-leaf");
+  const launch = await startFakeWorkflow(client);
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  const failed = snapshot.events.filter(
+    (event) => event.type === "leaf_failed",
+  );
+
+  assert.equal(snapshot.status, "failed");
+  assert.equal(failed.length, 1);
+  assert.equal(snapshot.counts.failed, 1);
+  assert.equal(snapshot.counts.active, 0);
+  assert.deepEqual(snapshot.activeLeaves, []);
+  assert.equal(
+    snapshot.events.filter((event) => event.type === "leaf_completed").length,
+    0,
+  );
+  assert.ok(Number.isInteger(failed[0].durationMs));
+  assert.ok(failed[0].durationMs >= 0);
+});
+
+test("bounded journal reads preserve split UTF-8 and emit each event once", async (t) => {
+  const { hookPath, markerPath } = await createPartialReadHook(t);
+  const nodeOptions = [
+    process.env.NODE_OPTIONS,
+    `--import=${hookPath}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const { client } = await startFakeModeClient(t, "split-journal", {
+    NODE_OPTIONS: nodeOptions,
+  });
+  const launch = await startFakeWorkflow(client);
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  const eventTypes = snapshot.events.map((event) => event.type);
+
+  assert.equal(snapshot.status, "completed");
+  assert.deepEqual(eventTypes, [
+    "leaf_started",
+    "leaf_completed",
+    "workflow_completed",
+  ]);
+  assert.equal(snapshot.revision, 3);
+  assert.equal(new Set(snapshot.events.map((event) => event.revision)).size, 3);
+  assert.equal(snapshot.counts.completed, 1);
+  assert.equal(snapshot.counts.active, 0);
+  await waitForFileText(markerPath, "partial");
+});
+
+test("WorkflowStatus returns a heartbeat when no journal or state changes", async (t) => {
+  const { client } = await startFakeModeClient(t, "no-state");
+  const launch = await startFakeWorkflow(client);
+  const snapshot = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 10 },
+    }),
+  );
+
+  assert.equal(snapshot.status, "running");
+  assert.equal(snapshot.revision, 0);
+  assert.equal(snapshot.heartbeat, true);
+  assert.deepEqual(snapshot.events, []);
+
+  await client.request("tools/call", {
+    name: "WorkflowStop",
+    arguments: { runId: launch.runId },
+  });
+});
+
+test("WorkflowStop emits workflow_killed, terminates Claude, and is idempotent", async (t) => {
+  const markerRoot = await mkdtemp(join(tmpdir(), "codex-workflow-stop-"));
+  const marker = join(markerRoot, "lifecycle");
+  t.after(() => rm(markerRoot, { recursive: true, force: true }));
+  const { client } = await startFakeModeClient(t, "no-state", {
+    FAKE_WORKFLOW_MARKER: marker,
+  });
+  const launch = await startFakeWorkflow(client);
+  await waitForFileText(marker, "running");
+
+  const first = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStop",
+      arguments: { runId: launch.runId },
+    }),
+  );
+  assert.equal(first.status, "killed");
+  assert.equal(first.events.at(-1).type, "workflow_killed");
+  assert.equal(terminalWorkflowEvents(first).length, 1);
+  assert.equal(first.counts.active, 0);
+  await waitForFileText(marker, "terminated");
+
+  const second = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStop",
+      arguments: { runId: launch.runId },
+    }),
+  );
+  assert.equal(second.status, "killed");
+  assert.equal(second.revision, first.revision);
+  assert.deepEqual(second.events, first.events);
+  assert.equal(terminalWorkflowEvents(second).length, 1);
+});
+
+test("terminal journal drain keeps a just-appended leaf result", async (t) => {
+  const gate = await createWatcherGate(t, "after-journal");
+  const { client, stateRoot } = await startFakeModeClient(
+    t,
+    "terminal-drain",
+    { CODEX_WORKFLOW_TEST_GATE_DIR: gate.gateDir },
+  );
+  const launch = await startFakeWorkflow(client);
+  await waitForFileText(gate.ready, "ready");
+
+  await appendFile(
+    fakeJournalPath(stateRoot, launch.runId),
+    `${JSON.stringify({
+      type: "result",
+      agentId: "agentone",
+      result: "SECRET_LEAF_RESULT",
+    })}\n`,
+  );
+  await writeFile(
+    join(stateRoot, `${launch.runId}.json`),
+    JSON.stringify({
+      runId: launch.runId,
+      status: "completed",
+      result: { ok: true },
+    }),
+  );
+  await writeFile(gate.release, "");
+
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  const eventTypes = snapshot.events.map((event) => event.type);
+  assert.equal(snapshot.status, "completed");
+  assert.ok(
+    eventTypes.indexOf("leaf_completed") <
+      eventTypes.indexOf("workflow_completed"),
+  );
+  assert.equal(snapshot.counts.active, 0);
+  assert.equal(snapshot.counts.completed, 1);
+  assert.equal(terminalWorkflowEvents(snapshot).length, 1);
+});
+
+test("WorkflowStop wins over an already-read native terminal state", async (t) => {
+  const gate = await createWatcherGate(t, "after-state-read");
+  const { client } = await startFakeModeClient(t, "complete", {
+    CODEX_WORKFLOW_TEST_GATE_DIR: gate.gateDir,
+  });
+  const launch = await startFakeWorkflow(client);
+  await waitForFileText(gate.ready, "ready");
+
+  const stopped = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStop",
+      arguments: { runId: launch.runId },
+    }),
+  );
+  assert.equal(stopped.status, "killed");
+  await writeFile(gate.release, "");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const snapshot = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: { runId: launch.runId },
+    }),
+  );
+  assert.equal(snapshot.status, "killed");
+  assert.equal(terminalWorkflowEvents(snapshot).length, 1);
+  assert.equal(terminalWorkflowEvents(snapshot)[0].type, "workflow_killed");
+});
+
+test("malformed native progress fails once and the same server accepts another run", async (t) => {
+  for (const mode of ["malformed-journal", "malformed-state"]) {
+    await t.test(mode, async (subtest) => {
+      const { client, stateRoot } = await startFakeModeClient(subtest, mode);
+      const firstLaunch = await startFakeWorkflow(client);
+      const failed = await collectWorkflowEvents(client, firstLaunch.runId);
+      assert.equal(failed.status, "failed");
+      assert.equal(terminalWorkflowEvents(failed).length, 1);
+      assert.equal(terminalWorkflowEvents(failed)[0].type, "workflow_failed");
+      assert.doesNotMatch(
+        JSON.stringify(failed),
+        /journal\\.jsonl|subagents|\\{"type":/,
+      );
+
+      await setFakeWorkflowMode(stateRoot, "complete");
+      const secondLaunch = await startFakeWorkflow(client);
+      const completed = await collectWorkflowEvents(
+        client,
+        secondLaunch.runId,
+      );
+      assert.equal(completed.status, "completed");
+      assert.equal(
+        terminalWorkflowEvents(completed).at(-1).type,
+        "workflow_completed",
+      );
+    });
+  }
+});
+
+test("closing adapter input terminates every active Claude workflow", async (t) => {
+  const { fakeBin, stateRoot } = await createWorkflowClaude(t);
+  const markerRoot = join(stateRoot, "children");
+  await mkdir(markerRoot, { recursive: true });
+  await setFakeWorkflowMode(stateRoot, "no-state");
+  const client = startClient({
+    PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
+    FAKE_WORKFLOW_STATE_ROOT: stateRoot,
+    FAKE_WORKFLOW_UNIQUE_RUNS: "1",
+    FAKE_WORKFLOW_MARKER_ROOT: markerRoot,
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "placeholder",
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+
+  const first = await startFakeWorkflow(client);
+  const second = await startFakeWorkflow(client);
+  assert.notEqual(first.runId, second.runId);
+  await waitForFileText(join(markerRoot, first.runId), "running");
+  await waitForFileText(join(markerRoot, second.runId), "running");
+
+  client.closeInput();
+  await waitForFileText(join(markerRoot, first.runId), "terminated");
+  await waitForFileText(join(markerRoot, second.runId), "terminated");
+});
+
+test("an unexpected Claude exit produces one workflow_failed event", async (t) => {
+  const { client } = await startFakeModeClient(t, "exit");
+  const launch = await startFakeWorkflow(client);
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+
+  assert.equal(snapshot.status, "failed");
+  assert.equal(terminalWorkflowEvents(snapshot).length, 1);
+  assert.equal(
+    terminalWorkflowEvents(snapshot)[0].type,
+    "workflow_failed",
+  );
 });
 
 test(

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
@@ -15,6 +15,9 @@ const JOURNAL_CHUNK_BYTES = 64 * 1024;
 const POLL_INTERVAL_MS = 250;
 const MAX_SCRIPT_LENGTH = 524_288;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const PROGRESS_PATTERN =
+  /<codex-workflow-progress>(.{1,1024}?)<\/codex-workflow-progress>/;
+const AGENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const PROVIDER_KEYS = new Set([
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
@@ -389,6 +392,12 @@ async function startWorkflow(nativeArguments, cwd) {
     });
     const launch = parseNativeLaunch(response);
     const workflowRoot = dirname(dirname(launch.scriptPath));
+    const transcriptRoot = join(
+      dirname(workflowRoot),
+      "subagents",
+      "workflows",
+      launch.runId,
+    );
     const run = {
       runId: launch.runId,
       child: native.child,
@@ -401,12 +410,12 @@ async function startWorkflow(nativeArguments, cwd) {
       leaves: new Map(),
       currentPhase: null,
       statePath: join(workflowRoot, `${launch.runId}.json`),
-      transcriptRoot: join(
-        dirname(workflowRoot),
-        "subagents",
-        "workflows",
-        launch.runId,
-      ),
+      transcriptRoot,
+      journalPath: join(transcriptRoot, "journal.jsonl"),
+      journalOffset: 0,
+      journalTail: "",
+      journalDecoder: new TextDecoder("utf-8", { fatal: true }),
+      pendingJournalEvents: [],
       terminalState: undefined,
       result: undefined,
       terminal: false,
@@ -421,7 +430,11 @@ async function startWorkflow(nativeArguments, cwd) {
       run.failureMessage = "Claude Code stopped before workflow completion";
       finishRun(run, "failed");
     } else {
-      void watchRun(run).catch(() => {
+      void watchRun(run).catch((error) => {
+        run.failureMessage =
+          error instanceof Error
+            ? error.message
+            : "Unable to read workflow progress";
         finishRun(run, "failed");
       });
     }
@@ -511,10 +524,10 @@ function startNativeClient(cwd) {
     if (closed) return;
     closed = true;
     reader.close();
-    child.stdin.end();
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGTERM");
     }
+    child.stdin.end();
     children.delete(child);
   };
 
@@ -550,21 +563,280 @@ function parseNativeLaunch(nativeResult) {
   return launch;
 }
 
+async function readJournalAdditions(run) {
+  let file;
+  try {
+    file = await open(run.journalPath, "r");
+    const { size } = await file.stat();
+    const lines = [];
+    while (run.journalOffset < size) {
+      const length = Math.min(
+        JOURNAL_CHUNK_BYTES,
+        size - run.journalOffset,
+      );
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await file.read(
+        chunk,
+        0,
+        length,
+        run.journalOffset,
+      );
+      if (bytesRead === 0) break;
+      run.journalOffset += bytesRead;
+      const decoded = run.journalDecoder.decode(
+        chunk.subarray(0, bytesRead),
+        { stream: true },
+      );
+      const additions = `${run.journalTail}${decoded}`.split("\n");
+      run.journalTail = additions.pop();
+      lines.push(...additions.filter(Boolean));
+    }
+    return lines.map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw new Error("Unable to read workflow journal");
+  } finally {
+    await file?.close();
+  }
+}
+
+function fallbackProgressMetadata(agentId) {
+  return {
+    phase: null,
+    role: null,
+    label: `leaf-${agentId.slice(0, 8)}`,
+  };
+}
+
+function validateProgressMetadata(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (
+    typeof value.phase !== "string" ||
+    value.phase.length < 1 ||
+    value.phase.length > 80
+  ) {
+    return null;
+  }
+  if (
+    typeof value.role !== "string" ||
+    value.role.length < 1 ||
+    value.role.length > 80
+  ) {
+    return null;
+  }
+  if (
+    typeof value.label !== "string" ||
+    value.label.length < 1 ||
+    value.label.length > 80
+  ) {
+    return null;
+  }
+  return { phase: value.phase, role: value.role, label: value.label };
+}
+
+function progressMetadataFromText(text, agentId) {
+  const match = PROGRESS_PATTERN.exec(text);
+  if (!match) return fallbackProgressMetadata(agentId);
+  try {
+    return (
+      validateProgressMetadata(JSON.parse(match[1])) ??
+      fallbackProgressMetadata(agentId)
+    );
+  } catch {
+    return fallbackProgressMetadata(agentId);
+  }
+}
+
+function userRecordText(record) {
+  if (record?.type !== "user" || record?.message?.role !== "user") {
+    return undefined;
+  }
+  const { content } = record.message;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (block) => block?.type === "text" && typeof block.text === "string",
+    )
+    .map((block) => block.text)
+    .join("");
+}
+
+async function readProgressMetadata(run, agentId) {
+  if (!AGENT_ID_PATTERN.test(agentId)) {
+    throw new Error("Claude Code returned an invalid workflow journal");
+  }
+
+  const resolvedTranscriptRoot = resolve(run.transcriptRoot);
+  const candidate = resolve(
+    resolvedTranscriptRoot,
+    `agent-${agentId}.jsonl`,
+  );
+  if (dirname(candidate) !== resolvedTranscriptRoot) {
+    throw new Error("Claude Code returned an invalid workflow journal");
+  }
+
+  let file;
+  try {
+    file = await open(candidate, "r");
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let offset = 0;
+    let tail = "";
+    while (offset < MAX_TRANSCRIPT_PREFIX_BYTES) {
+      const length = Math.min(
+        JOURNAL_CHUNK_BYTES,
+        MAX_TRANSCRIPT_PREFIX_BYTES - offset,
+      );
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await file.read(chunk, 0, length, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      const decoded = decoder.decode(chunk.subarray(0, bytesRead), {
+        stream: true,
+      });
+      const lines = `${tail}${decoded}`.split("\n");
+      tail = lines.pop();
+      for (const line of lines) {
+        if (!line) continue;
+        let record;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          return fallbackProgressMetadata(agentId);
+        }
+        const text = userRecordText(record);
+        if (text !== undefined) {
+          return progressMetadataFromText(text, agentId);
+        }
+      }
+    }
+    return fallbackProgressMetadata(agentId);
+  } catch (error) {
+    if (error?.code === "ENOENT") return fallbackProgressMetadata(agentId);
+    throw new Error("Unable to read workflow transcript");
+  } finally {
+    await file?.close();
+  }
+}
+
+async function processJournalEvents(run, events) {
+  run.pendingJournalEvents.push(...events);
+  while (!run.terminal && run.pendingJournalEvents.length > 0) {
+    const event = run.pendingJournalEvents.shift();
+    if (
+      !event ||
+      typeof event !== "object" ||
+      Array.isArray(event) ||
+      !["started", "result"].includes(event.type) ||
+      typeof event.agentId !== "string" ||
+      !AGENT_ID_PATTERN.test(event.agentId)
+    ) {
+      throw new Error("Claude Code returned an invalid workflow journal");
+    }
+
+    if (event.type === "started") {
+      if (run.leaves.has(event.agentId)) {
+        throw new Error("Claude Code returned an invalid workflow journal");
+      }
+      const startedAt = Date.now();
+      const metadata = await readProgressMetadata(run, event.agentId);
+      if (run.terminal) return;
+      const leaf = {
+        id: event.agentId,
+        ...metadata,
+        status: "active",
+        startedAt,
+        finishedAt: undefined,
+      };
+      run.leaves.set(leaf.id, leaf);
+      run.currentPhase = leaf.phase;
+      appendEvent(run, {
+        type: "leaf_started",
+        id: leaf.id,
+        phase: leaf.phase,
+        role: leaf.role,
+        label: leaf.label,
+      });
+      continue;
+    }
+
+    const leaf = run.leaves.get(event.agentId);
+    if (!leaf || leaf.status !== "active") {
+      throw new Error("Claude Code returned an invalid workflow journal");
+    }
+    leaf.status = "completed";
+    leaf.finishedAt = Date.now();
+    appendEvent(run, {
+      type: "leaf_completed",
+      id: leaf.id,
+      phase: leaf.phase,
+      role: leaf.role,
+      label: leaf.label,
+      durationMs: leaf.finishedAt - leaf.startedAt,
+    });
+  }
+}
+
+function flushJournalDecoder(run) {
+  try {
+    const tail = `${run.journalTail}${run.journalDecoder.decode()}`;
+    run.journalTail = "";
+    return tail ? [JSON.parse(tail)] : [];
+  } catch {
+    throw new Error("Unable to read workflow journal");
+  }
+}
+
+async function waitAtTestGate(run, point) {
+  const gateDir = process.env.CODEX_WORKFLOW_TEST_GATE_DIR;
+  if (!gateDir) return;
+  const gate = join(gateDir, `${run.runId}.${point}`);
+  try {
+    await readFile(`${gate}.block`);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw new Error("Unable to coordinate workflow watcher");
+  }
+  try {
+    await writeFile(`${gate}.ready`, "ready");
+    while (true) {
+      try {
+        await readFile(`${gate}.release`);
+        return;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await delay(5);
+    }
+  } catch {
+    throw new Error("Unable to coordinate workflow watcher");
+  }
+}
+
 async function readNativeState(run) {
   try {
-    return JSON.parse(await readFile(run.statePath, "utf8"));
+    const state = JSON.parse(await readFile(run.statePath, "utf8"));
+    await waitAtTestGate(run, "after-state-read");
+    return state;
   } catch (error) {
-    if (error?.code === "ENOENT" || error instanceof SyntaxError) return undefined;
+    if (error?.code === "ENOENT") return undefined;
     throw new Error("Unable to read workflow state");
   }
 }
 
 async function watchRun(run) {
   while (!run.terminal) {
+    const additions = await readJournalAdditions(run);
+    if (run.terminal) return;
+    await processJournalEvents(run, additions);
+    if (run.terminal) return;
+    await waitAtTestGate(run, "after-journal");
+    if (run.terminal) return;
+
     const state = await readNativeState(run);
     if (run.terminal) return;
     if (state) {
-      finishFromNativeState(run, state);
+      await finishFromNativeState(run, state);
       return;
     }
     await delay(POLL_INTERVAL_MS);
@@ -572,7 +844,7 @@ async function watchRun(run) {
   }
 }
 
-function finishFromNativeState(run, state) {
+async function finishFromNativeState(run, state) {
   if (
     !state ||
     state.runId !== run.runId ||
@@ -580,12 +852,35 @@ function finishFromNativeState(run, state) {
   ) {
     throw new Error("Claude Code returned an invalid workflow state");
   }
+
+  const additions = await readJournalAdditions(run);
+  if (run.terminal) return;
+  await processJournalEvents(run, additions);
+  if (run.terminal) return;
+  await processJournalEvents(run, flushJournalDecoder(run));
+  if (run.terminal) return;
   finishRun(run, state.status, state);
 }
 
 function appendEvent(run, event) {
   run.revision += 1;
   run.events.push({ revision: run.revision, ...event });
+}
+
+function failOpenLeaves(run) {
+  for (const leaf of run.leaves.values()) {
+    if (leaf.status !== "active") continue;
+    leaf.status = "failed";
+    leaf.finishedAt = run.finishedAt;
+    appendEvent(run, {
+      type: "leaf_failed",
+      id: leaf.id,
+      phase: leaf.phase,
+      role: leaf.role,
+      label: leaf.label,
+      durationMs: leaf.finishedAt - leaf.startedAt,
+    });
+  }
 }
 
 function finishRun(run, status, terminalState) {
@@ -595,6 +890,7 @@ function finishRun(run, status, terminalState) {
   run.finishedAt = Date.now();
   run.terminalState = terminalState;
   run.result = terminalState?.result;
+  failOpenLeaves(run);
   appendEvent(run, { type: `workflow_${status}` });
   run.close();
   return true;
