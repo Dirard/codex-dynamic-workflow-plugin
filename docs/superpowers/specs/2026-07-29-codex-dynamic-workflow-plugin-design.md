@@ -34,10 +34,14 @@ tests/mcp-boundary.test.mjs
 
 - `plugin.json` описывает плагин и подключает skill и MCP-конфигурацию.
 - `.mcp.json` запускает установленный `claude` в режиме MCP с
-  `CLAUDE_CODE_WORKFLOWS=1` и session model `glm-5.2`.
+  `CLAUDE_CODE_WORKFLOWS=1`, session model `glm-5.2` и Codex-side tool timeout
+  620 секунд для десятиминутного `TaskOutput`.
 - `SKILL.md` учит Codex формировать точный self-contained Workflow script и
   сохраняет границу «Codex планирует, GLM исполняет».
-- `openai.yaml` содержит краткие метаданные skill для интерфейса.
+- `openai.yaml` содержит краткие метаданные skill, зависимость от bundled MCP и
+  запрещает implicit invocation: запуск дорогого workflow требует явного
+  `$codex-dynamic-workflow-plugin:native-workflow` или прямой просьбы
+  пользователя.
 - Boundary-test использует только Node.js stdlib, запускает реальную команду из
   `.mcp.json` и проверяет MCP handshake и опубликованные инструменты.
 
@@ -45,16 +49,19 @@ tests/mcp-boundary.test.mjs
 
 1. Codex изучает задачу и рабочее дерево, затем сам формирует окончательный
    top-level JavaScript без импортов.
-2. Codex вызывает `claude-workflow:Workflow`, передавая точный `script`, `name`
-   и при необходимости `args`.
+2. Codex вызывает `claude-workflow:Workflow`, передавая точный `script` и при
+   необходимости `args`. Имя inline workflow находится в `meta.name`;
+   top-level `Workflow.name` применяется только вместо `script` для запуска
+   заранее сохранённого workflow.
 3. Нативный runtime исполняет `agent()`, `parallel()`, `pipeline()` и другие
    поддерживаемые примитивы. Все leaf agents наследуют session model
    `glm-5.2`; сценарий не задаёт другую модель или нестандартный `agentType`.
-4. Для фонового запуска Codex получает результат через
+4. `Workflow` возвращает background task ID. Если пользователь явно не просил
+   фоновый режим, Codex дожидается completed result через
    `claude-workflow:TaskOutput`; для отмены использует
    `claude-workflow:TaskStop`.
-5. Codex проверяет выходы и самостоятельно принимает следующее оркестрационное
-   решение.
+5. Codex отвечает только после проверки завершённых выходов и самостоятельно
+   принимает следующее оркестрационное решение.
 
 Workflow script должен быть детерминированным plain JavaScript: без imports,
 Node.js API, `Date.now()` и `Math.random()`. `meta` — только pure literal.
@@ -73,6 +80,12 @@ CLAUDE_CODE_WORKFLOWS=1 claude --disable-slash-commands --model glm-5.2 mcp serv
 leaf agents работали в том же проекте и под действующими sandbox/approval
 ограничениями.
 
+Skill имеет `policy.allow_implicit_invocation: false` и объявляет stdio
+dependency `claude-workflow` с command `claude`. В установленном plugin Codex
+запускает workflow только после явного
+`$codex-dynamic-workflow-plugin:native-workflow` или прямого запроса
+пользователя.
+
 Если `claude` отсутствует, MCP не публикует `Workflow` или вызов leaf agent
 завершается ошибкой, Codex сообщает конкретную ошибку. Он не заменяет вызов
 свободным промптом и не передаёт планирование GLM.
@@ -83,11 +96,13 @@ leaf agents работали в том же проекте и под дейст�
   `glm-5.2`.
 - Node.js boundary-test проверяет настоящий MCP handshake и наличие
   `Workflow`, `TaskOutput`, `TaskStop`, а не текст конфигурации.
-- Read-only canary запускает два независимых `agent()` и синтез результата,
-  подтверждая совместимость GLM с нативным Workflow.
+- Read-only canary запускает два независимых `agent()` параллельно и третий
+  зависимый `agent()` для синтеза, подтверждая совместимость GLM с нативным
+  Workflow.
 - Skill проходит baseline/forward-test: без skill Codex сохраняет правильную
-  роль, но формирует несуществующий JSON DAG; со skill он должен выдать точный
-  executable JavaScript и вызвать нативный `Workflow`.
+  роль, но формирует несуществующий JSON DAG; со skill в чистом временном
+  fixture и без user config он должен вызвать нативный `Workflow`, дождаться
+  `TaskOutput` и вернуть непустые результаты всех leaf agents.
 - Плагин и skill проходят штатные валидаторы Codex.
 
 ## Ограничения первой версии
