@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "claude-workflow": {
+      "command": "claude",
+      "args": [
+        "--disable-slash-commands",
+        "--model",
+        "glm-5.2",
+        "mcp",
+        "serve"
+      ],
+      "env": {
+        "CLAUDE_CODE_WORKFLOWS": "1",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "glm-5.2"
+      },
+      "tool_timeout_sec": 620
+    }
+  }
+}
