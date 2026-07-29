@@ -12,7 +12,7 @@
         "ANTHROPIC_BASE_URL",
         "XDG_CONFIG_HOME"
       ],
-      "tool_timeout_sec": 620
+      "tool_timeout_sec": 31536000
     }
   }
 }

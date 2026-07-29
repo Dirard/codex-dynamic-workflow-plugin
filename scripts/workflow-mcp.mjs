@@ -7,9 +7,8 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
-const MAX_STATUS_WAIT_MS = 20_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
 const POLL_INTERVAL_MS = 250;
@@ -52,22 +51,17 @@ const workflowStartTool = {
   inputSchema: workflowInputSchema,
 };
 
-const workflowStatusTool = {
-  name: "WorkflowStatus",
-  description: "Read progress and terminal status for a workflow run.",
+const workflowWaitTool = {
+  name: "WorkflowWait",
+  description:
+    "Wait for a workflow revision or terminal state and return its progress snapshot.",
   inputSchema: {
     type: "object",
     properties: {
       runId: { type: "string", minLength: 1 },
-      afterRevision: { type: "integer", minimum: 0, default: 0 },
-      waitMs: {
-        type: "integer",
-        minimum: 0,
-        maximum: MAX_STATUS_WAIT_MS,
-        default: 0,
-      },
+      afterRevision: { type: "integer", minimum: 0 },
     },
-    required: ["runId"],
+    required: ["runId", "afterRevision"],
     additionalProperties: false,
   },
 };
@@ -94,7 +88,7 @@ const workflowTool = {
 
 const tools = [
   workflowStartTool,
-  workflowStatusTool,
+  workflowWaitTool,
   workflowStopTool,
   workflowTool,
 ];
@@ -231,8 +225,8 @@ async function handleMessage(message) {
           version: SERVER_VERSION,
         },
         instructions:
-          "Use WorkflowStart, then poll WorkflowStatus with its latest revision until terminal. " +
-          "Report phase/role/leaf changes and heartbeat updates. Use WorkflowStop when the run is cancelled.",
+          "Use WorkflowStart, then call WorkflowWait with the latest revision until terminal. " +
+          "Report phase/role/leaf changes. Use WorkflowStop when the run is cancelled.",
       });
       return;
     case "ping":
@@ -256,8 +250,8 @@ async function callTool(params) {
         return await callWorkflow(params.arguments, false);
       case "WorkflowStart":
         return await callWorkflow(params.arguments, true);
-      case "WorkflowStatus":
-        return await callWorkflowStatus(params.arguments);
+      case "WorkflowWait":
+        return await callWorkflowWait(params.arguments);
       case "WorkflowStop":
         return callWorkflowStop(params.arguments);
       default:
@@ -287,15 +281,18 @@ async function callWorkflow(args, asynchronous) {
   });
 }
 
-async function callWorkflowStatus(args) {
-  const validationError = validateStatusArguments(args);
+async function callWorkflowWait(args) {
+  const validationError = validateWaitArguments(args);
   if (validationError) return toolError(validationError);
 
   const run = runs.get(args.runId);
   if (!run) return toolError("Unknown workflow run");
-  return toolSuccess(
-    await waitForStatus(run, args.afterRevision ?? 0, args.waitMs ?? 0),
-  );
+  if (args.afterRevision > run.revision) {
+    return toolError(
+      "WorkflowWait afterRevision cannot exceed current revision",
+    );
+  }
+  return toolSuccess(await waitForUpdate(run, args.afterRevision));
 }
 
 function callWorkflowStop(args) {
@@ -330,33 +327,22 @@ function validateArguments(args) {
   return null;
 }
 
-function validateStatusArguments(args) {
+function validateWaitArguments(args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
-    return "WorkflowStatus arguments must be an object";
+    return "WorkflowWait arguments must be an object";
   }
   if (
     Object.keys(args).some(
-      (key) =>
-        key !== "runId" && key !== "afterRevision" && key !== "waitMs",
+      (key) => key !== "runId" && key !== "afterRevision",
     )
   ) {
-    return "WorkflowStatus received an unsupported argument";
+    return "WorkflowWait received an unsupported argument";
   }
   if (typeof args.runId !== "string" || !args.runId) {
-    return "WorkflowStatus runId must be a non-empty string";
+    return "WorkflowWait runId must be a non-empty string";
   }
-
-  const afterRevision = args.afterRevision ?? 0;
-  if (!Number.isInteger(afterRevision) || afterRevision < 0) {
-    return "WorkflowStatus afterRevision must be a non-negative integer";
-  }
-  const waitMs = args.waitMs ?? 0;
-  if (
-    !Number.isInteger(waitMs) ||
-    waitMs < 0 ||
-    waitMs > MAX_STATUS_WAIT_MS
-  ) {
-    return `WorkflowStatus waitMs must be an integer between 0 and ${MAX_STATUS_WAIT_MS}`;
+  if (!Number.isInteger(args.afterRevision) || args.afterRevision < 0) {
+    return "WorkflowWait afterRevision must be a non-negative integer";
   }
   return null;
 }
@@ -407,6 +393,7 @@ async function startWorkflow(nativeArguments, cwd) {
       status: "running",
       revision: 0,
       events: [],
+      waiters: new Set(),
       leaves: new Map(),
       currentPhase: null,
       statePath: join(workflowRoot, `${launch.runId}.json`),
@@ -879,6 +866,8 @@ async function finishFromNativeState(run, state) {
 function appendEvent(run, event) {
   run.revision += 1;
   run.events.push({ revision: run.revision, ...event });
+  for (const resolveWaiter of run.waiters) resolveWaiter();
+  run.waiters.clear();
 }
 
 function failOpenLeaves(run) {
@@ -910,7 +899,7 @@ function finishRun(run, status, terminalState) {
   return true;
 }
 
-function snapshotRun(run, afterRevision, heartbeat) {
+function snapshotRun(run, afterRevision) {
   const now = run.finishedAt ?? Date.now();
   const counts = { started: 0, active: 0, completed: 0, failed: 0 };
   const activeLeaves = [];
@@ -936,7 +925,6 @@ function snapshotRun(run, afterRevision, heartbeat) {
     runId: run.runId,
     status: run.status,
     revision: run.revision,
-    heartbeat,
     elapsedMs: now - run.startedAt,
     currentPhase: run.currentPhase,
     counts,
@@ -947,22 +935,18 @@ function snapshotRun(run, afterRevision, heartbeat) {
   return snapshot;
 }
 
-async function waitForStatus(run, afterRevision, waitMs) {
-  const deadline = Date.now() + waitMs;
-  while (
-    !run.terminal &&
-    run.revision <= afterRevision &&
-    Date.now() < deadline
-  ) {
-    await delay(Math.min(POLL_INTERVAL_MS, deadline - Date.now()));
+async function waitForUpdate(run, afterRevision) {
+  if (!run.terminal && run.revision <= afterRevision) {
+    await new Promise((resolveWaiter) => {
+      run.waiters.add(resolveWaiter);
+    });
   }
-  const heartbeat = !run.terminal && run.revision <= afterRevision;
-  return snapshotRun(run, afterRevision, heartbeat);
+  return snapshotRun(run, afterRevision);
 }
 
 function stopWorkflow(run) {
   finishRun(run, "killed");
-  return snapshotRun(run, 0, false);
+  return snapshotRun(run, 0);
 }
 
 async function runWorkflow(nativeArguments, cwd) {
