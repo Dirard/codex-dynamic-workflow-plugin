@@ -3,9 +3,9 @@
 ## Цель
 
 Codex должен сразу получать идентификатор запущенного Claude Code Dynamic
-Workflow, видеть фактические переходы leaf-задач и регулярно сообщать
-пользователю, что работа продолжается. Большой workflow не должен завершаться
-из-за общего временного лимита.
+Workflow, видеть фактические переходы leaf-задач, включая специализированную
+роль, и регулярно сообщать пользователю, что работа продолжается. Большой
+workflow не должен завершаться из-за общего временного лимита.
 
 Codex остаётся оркестратором: он строит DAG, формирует точный JavaScript,
 запускает workflow, интерпретирует статус и решает, что делать после terminal
@@ -31,7 +31,8 @@ result. GLM-5.2 выполняет только leaf-вызовы `agent()`.
 1. Codex вызывает `WorkflowStart` и сразу получает `runId`.
 2. Codex сообщает пользователю, что workflow запущен и какая phase начинается.
 3. Codex вызывает `WorkflowStatus` с long-poll до 20 секунд.
-4. При изменении Codex сообщает новую phase и started/completed/failed leaf.
+4. При изменении Codex сообщает новую phase, роль и
+   started/completed/failed leaf.
 5. Если изменений нет, Codex раз в 20 секунд даёт короткий heartbeat.
 6. После terminal status Codex проверяет result и сам принимает следующее
    оркестрационное решение.
@@ -103,6 +104,7 @@ long-poll, а не workflow.
     {
       "id": "a1b2c3d4",
       "phase": "Inspect",
+      "role": "correctness",
       "label": "inspect-readme",
       "elapsedMs": 12000
     }
@@ -113,6 +115,7 @@ long-poll, а не workflow.
       "type": "leaf_started",
       "id": "a1b2c3d4",
       "phase": "Inspect",
+      "role": "correctness",
       "label": "inspect-readme"
     }
   ]
@@ -148,12 +151,12 @@ native workflow.
 ## Источник phase и leaf metadata
 
 Journal содержит фактические `agentId`, `started` и `result`, но не сохраняет
-native `label` и `phase`. Для точного отображения обновлённый skill формирует
-каждый leaf через небольшой helper:
+native `label`, `phase` и prompt-based `role`. Для точного отображения
+обновлённый skill формирует каждый leaf через небольшой helper:
 
 ```js
-function leaf(phaseName, label, prompt, options = {}) {
-  const progress = JSON.stringify({ phase: phaseName, label });
+function leaf(phaseName, role, label, prompt, options = {}) {
+  const progress = JSON.stringify({ phase: phaseName, role, label });
   return agent(
     `<codex-workflow-progress>${progress}</codex-workflow-progress>\n${prompt}`,
     { ...options, label, phase: phaseName },
@@ -164,7 +167,41 @@ function leaf(phaseName, label, prompt, options = {}) {
 Status reader извлекает только строгую progress-метку из первой user-записи
 agent transcript. Prompt, transcript, leaf result и filesystem paths не
 возвращаются. Некорректная, отсутствующая или слишком длинная метка даёт
-`label: "leaf-<id>"` и `phase: null`, не прерывая native workflow.
+`label: "leaf-<id>"`, `phase: null` и `role: null`, не прерывая native
+workflow.
+
+## Prompt-based reviewer roles
+
+Skill предоставляет девять готовых контрактов:
+
+- `product` — соответствие задаче и пользовательская ценность;
+- `correctness` — логика, состояния и граничные случаи;
+- `security` — trust boundaries, permissions и утечки;
+- `tests` — валидность тестов и существенные пробелы;
+- `architecture` — границы модулей и зависимости;
+- `api-compatibility` — публичные контракты и обратная совместимость;
+- `performance` — алгоритмические, конкурентные и ресурсные риски;
+- `simplicity` — лишняя сложность и минимально достаточное решение;
+- `synthesis` — дедупликация результатов без добавления новых findings.
+
+Это prompt-контракты, а не Claude custom `agentType` и не техническая граница
+permissions. `claude mcp serve` в версии 2.1.204 не передаёт custom agents в
+native workflow, а leaf по-прежнему может видеть `Bash`, `Edit` и `Write`.
+Поэтому reviewer prompt прямо запрещает изменения, команды с побочными
+эффектами, commits и внешние mutations, но Codex не выдаёт это за sandbox.
+Если нужна гарантированная изоляция, её обеспечивает окружение или permissions
+Claude Code вне плагина.
+
+Независимый review-cycle строится Codex:
+
+1. выбрать от пяти до восьми релевантных reviewer-ролей;
+2. дать каждому одинаковый исходный task context и отдельный role contract;
+3. запустить reviewers одновременно через `parallel()` без результатов друг
+   друга в prompts;
+4. после barrier передать структурированные outputs leaf с ролью `synthesis`;
+5. вернуть raw reviews и synthesis Codex;
+6. только Codex проверяет findings, решает, что исправлять, и запускает ли новый
+   цикл.
 
 ## Адаптированные Claude Workflow instructions
 
@@ -174,7 +211,8 @@ Skill сохраняет нативную модель Claude Code 2.1.204 и и
 - self-contained plain JavaScript начинается с pure-literal `meta`;
 - `meta` содержит `name`, `description` и `phases`;
 - названия в `meta.phases`, `phase()` и leaf `phase` совпадают точно;
-- каждый leaf имеет стабильный `label` и создаётся через `leaf()`;
+- каждый leaf имеет стабильные `role` и `label` и создаётся через `leaf()`;
+- reviewer roles остаются prompt-based; custom `agentType` не указывается;
 - `parallel()` получает функции, а не готовые promises;
 - `pipeline()` используется для независимых стадий без лишнего barrier;
 - structured leaf возвращает объект через JSON Schema;
@@ -227,13 +265,13 @@ Watcher не завершает workflow по времени. Отдельные
   `WorkflowStop` и совместимого `Workflow`.
 - Fake Claude подтверждает, что `WorkflowStart` возвращается до terminal state.
 - Инкрементальный fake journal проверяет revision, started/completed/failed
-  events, active counts, phase/label и heartbeat.
+  events, active counts, phase/role/label и heartbeat.
 - Отдельный тест подтверждает отсутствие prompt, leaf result и filesystem paths
   в non-terminal status.
 - Проверяются повторный `WorkflowStop`, unexpected child exit и shutdown cleanup.
 - Существующие синхронные boundary-tests остаются зелёными.
-- Live GLM canary наблюдает два параллельных leaf, затем synthesis leaf и final
-  non-empty result через асинхронный путь.
+- Live GLM canary наблюдает два независимых prompt-based reviewer leaf, затем
+  synthesis leaf и final non-empty result через асинхронный путь.
 - Plugin и skill проходят штатные валидаторы.
 
 ## Доставка
@@ -250,4 +288,6 @@ commit.
 - собственная база истории;
 - поток всех Claude logs в контекст Codex;
 - искусственный процент готовности;
+- технический per-leaf read-only sandbox;
+- регистрация custom Claude `agentType` через `mcp serve`;
 - общий execution deadline.
