@@ -662,7 +662,7 @@ function userRecordText(record) {
     .join("");
 }
 
-async function readProgressMetadata(run, agentId) {
+async function readProgressMetadata(run, agentId, forceFallback = false) {
   if (!AGENT_ID_PATTERN.test(agentId)) {
     throw new Error("Claude Code returned an invalid workflow journal");
   }
@@ -710,19 +710,27 @@ async function readProgressMetadata(run, agentId) {
         }
       }
     }
-    return fallbackProgressMetadata(agentId);
+    return offset >= MAX_TRANSCRIPT_PREFIX_BYTES || forceFallback
+      ? fallbackProgressMetadata(agentId)
+      : undefined;
   } catch (error) {
-    if (error?.code === "ENOENT") return fallbackProgressMetadata(agentId);
+    if (error?.code === "ENOENT") {
+      return forceFallback ? fallbackProgressMetadata(agentId) : undefined;
+    }
     throw new Error("Unable to read workflow transcript");
   } finally {
     await file?.close();
   }
 }
 
-async function processJournalEvents(run, events) {
-  run.pendingJournalEvents.push(...events);
+async function processJournalEvents(run, events, forceFallback = false) {
+  const observedAt = Date.now();
+  run.pendingJournalEvents.push(
+    ...events.map((event) => ({ event, observedAt })),
+  );
   while (!run.terminal && run.pendingJournalEvents.length > 0) {
-    const event = run.pendingJournalEvents.shift();
+    const pending = run.pendingJournalEvents[0];
+    const { event } = pending;
     if (
       !event ||
       typeof event !== "object" ||
@@ -738,14 +746,19 @@ async function processJournalEvents(run, events) {
       if (run.leaves.has(event.agentId)) {
         throw new Error("Claude Code returned an invalid workflow journal");
       }
-      const startedAt = Date.now();
-      const metadata = await readProgressMetadata(run, event.agentId);
+      const metadata = await readProgressMetadata(
+        run,
+        event.agentId,
+        forceFallback,
+      );
       if (run.terminal) return;
+      if (!metadata) return;
+      run.pendingJournalEvents.shift();
       const leaf = {
         id: event.agentId,
         ...metadata,
         status: "active",
-        startedAt,
+        startedAt: pending.observedAt,
         finishedAt: undefined,
       };
       run.leaves.set(leaf.id, leaf);
@@ -764,6 +777,7 @@ async function processJournalEvents(run, events) {
     if (!leaf || leaf.status !== "active") {
       throw new Error("Claude Code returned an invalid workflow journal");
     }
+    run.pendingJournalEvents.shift();
     leaf.status = "completed";
     leaf.finishedAt = Date.now();
     appendEvent(run, {
@@ -855,9 +869,9 @@ async function finishFromNativeState(run, state) {
 
   const additions = await readJournalAdditions(run);
   if (run.terminal) return;
-  await processJournalEvents(run, additions);
+  await processJournalEvents(run, additions, true);
   if (run.terminal) return;
-  await processJournalEvents(run, flushJournalDecoder(run));
+  await processJournalEvents(run, flushJournalDecoder(run), true);
   if (run.terminal) return;
   finishRun(run, state.status, state);
 }

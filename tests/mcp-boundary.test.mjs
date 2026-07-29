@@ -339,6 +339,13 @@ function markerText() {
 
 function writeTranscript(mode, agentId) {
   if (mode === "invalid-agent") return;
+  if (mode === "pending-transcript") {
+    fs.writeFileSync(
+      path.join(transcriptRoot, "agent-" + agentId + ".jsonl"),
+      '{"type":"user","message":{"role":"user","content":',
+    );
+    return;
+  }
   let records;
   if (mode === "later-marker") {
     records = [
@@ -407,6 +414,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       "later-marker",
       "large-user",
       "invalid-agent",
+      "pending-transcript",
       "split-journal",
     ].includes(mode)
   ) {
@@ -440,6 +448,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       "later-marker",
       "large-user",
       "invalid-agent",
+      "missing-transcript",
+      "pending-transcript",
     ].includes(mode)
   ) {
     appendJournal({ type: "started", agentId });
@@ -563,6 +573,16 @@ function fakeJournalPath(stateRoot, runId) {
     "workflows",
     runId,
     "journal.jsonl",
+  );
+}
+
+function fakeTranscriptPath(stateRoot, runId, agentId = "agentone") {
+  return join(
+    dirname(stateRoot),
+    "subagents",
+    "workflows",
+    runId,
+    `agent-${agentId}.jsonl`,
   );
 }
 
@@ -1078,6 +1098,123 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
   assert.equal(terminal.status, "completed");
   assert.equal(terminal.events[0].type, "workflow_completed");
   assert.ok(terminal.revision > leafCompleted.revision);
+});
+
+test("WorkflowStatus waits for a complete first user record before emitting leaf progress", async (t) => {
+  const gate = await createWatcherGate(t, "after-journal");
+  const { client, stateRoot } = await startFakeModeClient(
+    t,
+    "pending-transcript",
+    { CODEX_WORKFLOW_TEST_GATE_DIR: gate.gateDir },
+  );
+  const launch = await startFakeWorkflow(client);
+  await waitForFileText(gate.ready, "ready");
+
+  const waiting = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 10 },
+    }),
+  );
+  assert.equal(waiting.revision, 0);
+  assert.equal(waiting.heartbeat, true);
+  assert.deepEqual(waiting.events, []);
+
+  await writeFile(
+    fakeTranscriptPath(stateRoot, launch.runId),
+    `${JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content:
+          '<codex-workflow-progress>{"phase":"Synthesize","role":"synthesis","label":"synthesize-results"}</codex-workflow-progress>\nSECRET_DELAYED_PROMPT',
+      },
+    })}\n`,
+  );
+  await appendFile(
+    fakeJournalPath(stateRoot, launch.runId),
+    `${JSON.stringify({
+      type: "result",
+      agentId: "agentone",
+      result: "SECRET_DELAYED_RESULT",
+    })}\n`,
+  );
+  await writeFile(
+    join(stateRoot, `${launch.runId}.json`),
+    JSON.stringify({
+      runId: launch.runId,
+      status: "completed",
+      result: { ok: true },
+    }),
+  );
+  await writeFile(gate.release, "");
+
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  assert.equal(snapshot.status, "completed");
+  assert.deepEqual(
+    snapshot.events.map((event) => event.type),
+    ["leaf_started", "leaf_completed", "workflow_completed"],
+  );
+  assert.deepEqual(
+    snapshot.events.map((event) => event.revision),
+    [1, 2, 3],
+  );
+  assert.equal(snapshot.events[0].phase, "Synthesize");
+  assert.equal(snapshot.events[0].role, "synthesis");
+  assert.equal(snapshot.events[0].label, "synthesize-results");
+  assert.equal(snapshot.counts.active, 0);
+  assert.equal(snapshot.counts.completed, 1);
+  assert.doesNotMatch(
+    JSON.stringify(snapshot),
+    /SECRET_DELAYED_PROMPT|SECRET_DELAYED_RESULT|agent-agentone|subagents/,
+  );
+});
+
+test("terminal drain forces fallback for a permanently missing progress transcript", async (t) => {
+  const gate = await createWatcherGate(t, "after-journal");
+  const { client, stateRoot } = await startFakeModeClient(
+    t,
+    "missing-transcript",
+    { CODEX_WORKFLOW_TEST_GATE_DIR: gate.gateDir },
+  );
+  const launch = await startFakeWorkflow(client);
+  await waitForFileText(gate.ready, "ready");
+
+  const waiting = parseToolPayload(
+    await client.request("tools/call", {
+      name: "WorkflowStatus",
+      arguments: { runId: launch.runId, afterRevision: 0, waitMs: 10 },
+    }),
+  );
+  assert.equal(waiting.revision, 0);
+  assert.equal(waiting.heartbeat, true);
+  assert.deepEqual(waiting.events, []);
+
+  await writeFile(
+    join(stateRoot, `${launch.runId}.json`),
+    JSON.stringify({
+      runId: launch.runId,
+      status: "completed",
+      result: { ok: true },
+    }),
+  );
+  await writeFile(gate.release, "");
+
+  const snapshot = await collectWorkflowEvents(client, launch.runId);
+  assert.equal(snapshot.status, "completed");
+  assert.deepEqual(
+    snapshot.events.map((event) => event.type),
+    ["leaf_started", "leaf_failed", "workflow_completed"],
+  );
+  assert.deepEqual(
+    snapshot.events.map((event) => event.revision),
+    [1, 2, 3],
+  );
+  assert.equal(snapshot.events[0].phase, null);
+  assert.equal(snapshot.events[0].role, null);
+  assert.equal(snapshot.events[0].label, "leaf-agentone");
+  assert.equal(snapshot.counts.active, 0);
+  assert.equal(snapshot.counts.failed, 1);
 });
 
 test("WorkflowStatus rejects unknown runs and invalid polling arguments safely", async (t) => {
