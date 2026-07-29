@@ -1,81 +1,67 @@
 ---
 name: native-workflow
-description: Use when пользователь явно вызывает этот skill или прямо просит Codex запустить Claude Code Dynamic Workflow с GLM-5.2 leaf agents.
+description: Use when пользователь явно просит запустить Claude Code Dynamic Workflow, multi-agent orchestration или этот skill с GLM-5.2 leaf agents.
 ---
 
 # Native Workflow
 
-Codex определяет весь workflow. GLM-5.2 выполняет только точные leaf-задачи в
-`agent()`; не просить Claude или GLM построить, изменить или продолжить план.
+Codex определяет DAG, prompts, schemas, условия и следующие действия. GLM-5.2
+исполняет только leaf-вызовы `agent()`; не отдавать ему планирование workflow.
 
-## Выполнение
+## Подготовка
 
-1. Изучить задачу и workspace, затем самостоятельно зафиксировать DAG, промпты,
-   зависимости, схемы и условия.
-2. Сформировать self-contained top-level JavaScript: pure-literal `meta`, без
-   imports, Node.js API, `Date.now()` и `Math.random()`.
-3. Не указывать `model` или нестандартный `agentType`: leaf agents наследуют
-   `glm-5.2` из MCP session.
-4. Вызвать `claude-workflow:Workflow` с абсолютным `cwd` текущего workspace и
-   точным `script`; не передавать свободный goal вместо script.
-5. Дождаться синхронного ответа wrapper и проверить `status: "completed"`,
-   `result` и каждый leaf output. Только Codex решает, нужен ли следующий
-   workflow.
+1. Перед созданием любого script полностью прочитать
+   [references/claude-workflows.md](references/claude-workflows.md).
+2. Только для независимого review-cycle дополнительно прочитать
+   [references/reviewer-roles.md](references/reviewer-roles.md). Review — один
+   optional recipe; не добавлять reviewer roles в research, implementation,
+   migration или другой DAG без причины.
+3. Изучить workspace и самостоятельно определить точный work list, fan-out,
+   dependencies, barriers, prompts, JSON Schemas и stop conditions.
+
+## Tracked leaf
+
+Включить helper в каждый script и вызывать через него каждый `agent()`:
 
 ```js
-export const meta = {
-  name: "repository-analysis",
-  description: "Analyze architecture and tests in parallel",
-};
-
-const RESULT_SCHEMA = {
-  type: "object",
-  properties: { summary: { type: "string" } },
-  required: ["summary"],
-  additionalProperties: false,
-};
-
-const [architecture, tests] = await parallel([
-  () =>
-    agent("Analyze architecture. Return facts only.", {
-      label: "architecture",
-      schema: RESULT_SCHEMA,
-    }),
-  () =>
-    agent("Analyze tests and likely gaps. Return facts only.", {
-      label: "tests",
-      schema: RESULT_SCHEMA,
-    }),
-]);
-
-if (!architecture || !tests) {
-  throw new Error("Parallel analysis failed");
+function leaf(phaseName, role, label, prompt, options = {}) {
+  const progress = JSON.stringify({ phase: phaseName, role, label });
+  return agent(
+    `<codex-workflow-progress>${progress}</codex-workflow-progress>\n${prompt}`,
+    { ...options, label, phase: phaseName },
+  );
 }
-
-const synthesis = await agent(
-  `Synthesize both results. Return facts only.\n${JSON.stringify({
-    architecture,
-    tests,
-  })}`,
-  {
-    label: "synthesis",
-    schema: RESULT_SCHEMA,
-  },
-);
-
-return { architecture, tests, synthesis };
 ```
 
-## Вызов
+`phase`, `role` и `label` — стабильные строки длиной 1–80 символов. `role`
+описывает функцию leaf (`analysis`, `implementation`, `verification`,
+`synthesis` и т. п.), а не обязательно reviewer preset.
 
-Использовать `claude-workflow:Workflow({ cwd, script, args? })`. Wrapper запускает
-native Claude Code Workflow в `cwd`, дожидается terminal metadata и возвращает
-результат одним MCP-вызовом.
+Сохранять native contract: pure-literal `meta` с exact matching `phases`,
+`phase()` перед каждой стадией, plain JavaScript, functions в `parallel()`,
+`pipeline()` для независимых item chains, structured output через JSON Schema,
+real JSON в `args`. Не использовать imports, Node API, clocks/randomness,
+`model`, `effort` или custom `agentType`.
 
-До первого запуска настроить `ANTHROPIC_BASE_URL` и
-`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` в окружении Codex либо в
-`${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env`.
+## Запуск и status loop
 
-Если `Workflow` недоступен, возвращает `isError`, terminal status не
-`completed` или любой leaf output равен `null`, сообщить ошибку. Не заменять
-вызов свободным промптом, который отдаёт планирование GLM.
+1. Вызвать `claude-workflow:WorkflowStart({ cwd, script, args? })` с абсолютным
+   `cwd` и точным inline script.
+2. Сразу сообщить пользователю `runId` и первую запланированную phase.
+3. Повторять
+   `claude-workflow:WorkflowStatus({ runId, afterRevision, waitMs: 20000 })`,
+   передавая последний полученный `revision`.
+4. Сообщать только новые phase/role/leaf events. При `heartbeat: true` кратко
+   подтвердить, что работа продолжается, и назвать активную phase/role.
+5. Продолжать без общего deadline до `completed`, `failed` или `killed`.
+6. При отмене, замене задачи или явной команде пользователя вызвать
+   `claude-workflow:WorkflowStop({ runId })`.
+7. Проверить terminal result и каждый ожидаемый leaf output. Только Codex
+   решает, нужен ли следующий workflow.
+
+Старый `Workflow` остаётся compatibility tool; для новых и больших задач его
+не выбирать. `log()` — native diagnostic, не замена `WorkflowStatus`.
+
+Prompt-based read-only не является sandbox. Leaf может видеть `Bash`, `Edit` и
+`Write`; технические ограничения задаются permissions Claude Code или
+изолированным окружением.

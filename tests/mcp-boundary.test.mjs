@@ -26,11 +26,15 @@ const server = config.mcpServers["claude-workflow"];
 
 const canaryScript = `export const meta = {
   name: "readonly-parallel-canary",
-  description: "Run two independent read-only workspace inspections",
+  description: "Run two independent read-only reviews and synthesize them",
   phases: [
     {
-      title: "Inspect",
-      detail: "Two read-only agents inspect the workspace in parallel",
+      title: "Review",
+      detail: "Two read-only reviewers inspect the workspace in parallel",
+    },
+    {
+      title: "Synthesize",
+      detail: "Synthesize the independent reviews",
     },
   ],
 };
@@ -42,39 +46,44 @@ const RESULT_SCHEMA = {
   additionalProperties: false,
 };
 
-phase("Inspect");
+function leaf(phaseName, role, label, prompt, options = {}) {
+  const progress = JSON.stringify({ phase: phaseName, role, label });
+  return agent(
+    \`<codex-workflow-progress>\${progress}</codex-workflow-progress>\\n\${prompt}\`,
+    { ...options, label, phase: phaseName },
+  );
+}
 
+phase("Review");
 const [structure, documentation] = await parallel([
   () =>
-    agent(
+    leaf(
+      "Review",
+      "architecture",
+      "review-architecture",
       "Inspect the workspace structure without modifying anything. Return a concise summary.",
-      {
-        label: "inspect-structure",
-        phase: "Inspect",
-        schema: RESULT_SCHEMA,
-      },
+      { schema: RESULT_SCHEMA },
     ),
   () =>
-    agent(
+    leaf(
+      "Review",
+      "product",
+      "review-product",
       "Inspect project documentation without modifying anything. Return a concise summary.",
-      {
-        label: "inspect-documentation",
-        phase: "Inspect",
-        schema: RESULT_SCHEMA,
-      },
+      { schema: RESULT_SCHEMA },
     ),
 ]);
 
-const synthesis = await agent(
+phase("Synthesize");
+const synthesis = await leaf(
+  "Synthesize",
+  "synthesis",
+  "synthesize-reviews",
   \`Synthesize both inspections without new research.\\n\${JSON.stringify({
     structure,
     documentation,
   })}\`,
-  {
-    label: "synthesize-inspections",
-    phase: "Inspect",
-    schema: RESULT_SCHEMA,
-  },
+  { schema: RESULT_SCHEMA },
 );
 
 return { structure, documentation, synthesis };`;
@@ -88,6 +97,146 @@ function parseToolPayload(result) {
 function assertToolSuccess(result, name) {
   assert.notEqual(result.isError, true, `${name}: ${JSON.stringify(result)}`);
 }
+
+async function pollWorkflowToTerminal(
+  client,
+  launch,
+  deadline,
+  now = Date.now,
+) {
+  let afterRevision = launch.revision;
+  const events = [];
+  let terminal = false;
+
+  try {
+    while (true) {
+      const remaining = deadline - now();
+      if (remaining <= 0) throw new Error("Live workflow canary timed out");
+      const waitMs = Math.min(20_000, remaining);
+      const result = await client.request(
+        "tools/call",
+        {
+          name: "WorkflowStatus",
+          arguments: { runId: launch.runId, afterRevision, waitMs },
+        },
+        waitMs + 5_000,
+      );
+      assertToolSuccess(result, "WorkflowStatus");
+      const snapshot = parseToolPayload(result);
+      events.push(...snapshot.events);
+      afterRevision = snapshot.revision;
+      if (["completed", "failed", "killed"].includes(snapshot.status)) {
+        terminal = true;
+        return { ...snapshot, events };
+      }
+    }
+  } finally {
+    if (!terminal) {
+      const stopped = await client.request("tools/call", {
+        name: "WorkflowStop",
+        arguments: { runId: launch.runId },
+      });
+      assertToolSuccess(stopped, "WorkflowStop");
+    }
+  }
+}
+
+test("canary polling uses each returned revision until terminal", async () => {
+  const calls = [];
+  const snapshots = [
+    {
+      status: "running",
+      revision: 2,
+      events: [{ type: "leaf_started", role: "architecture" }],
+    },
+    {
+      status: "completed",
+      revision: 4,
+      events: [{ type: "workflow_completed" }],
+      result: { ok: true },
+    },
+  ];
+  const client = {
+    async request(method, params, timeout) {
+      calls.push({ method, params, timeout });
+      return {
+        content: [{ type: "text", text: JSON.stringify(snapshots.shift()) }],
+      };
+    },
+  };
+
+  const completed = await pollWorkflowToTerminal(
+    client,
+    { runId: "wf_canary", revision: 0 },
+    40_000,
+    () => 0,
+  );
+
+  assert.equal(completed.status, "completed");
+  assert.deepEqual(completed.events, [
+    { type: "leaf_started", role: "architecture" },
+    { type: "workflow_completed" },
+  ]);
+  assert.deepEqual(
+    calls.map(({ params, timeout }) => ({ ...params, timeout })),
+    [
+      {
+        name: "WorkflowStatus",
+        arguments: {
+          runId: "wf_canary",
+          afterRevision: 0,
+          waitMs: 20_000,
+        },
+        timeout: 25_000,
+      },
+      {
+        name: "WorkflowStatus",
+        arguments: {
+          runId: "wf_canary",
+          afterRevision: 2,
+          waitMs: 20_000,
+        },
+        timeout: 25_000,
+      },
+    ],
+  );
+});
+
+test("canary polling stops the run when its test deadline expires", async () => {
+  const calls = [];
+  const client = {
+    async request(method, params, timeout) {
+      calls.push({ method, params, timeout });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ status: "killed", runId: "wf_canary" }),
+          },
+        ],
+      };
+    },
+  };
+
+  await assert.rejects(
+    pollWorkflowToTerminal(
+      client,
+      { runId: "wf_canary", revision: 0 },
+      100,
+      () => 100,
+    ),
+    /timed out/,
+  );
+  assert.deepEqual(
+    calls.map(({ params }) => params),
+    [
+      {
+        name: "WorkflowStop",
+        arguments: { runId: "wf_canary" },
+      },
+    ],
+  );
+});
 
 async function initialize(client) {
   const initialized = await client.request("initialize", {
@@ -1287,34 +1436,42 @@ test("an unexpected Claude exit produces one workflow_failed event", async (t) =
 });
 
 test(
-  "GLM executes two parallel read-only leaves and a synthesis leaf",
+  "GLM exposes parallel reviewer leaves and a synthesis leaf",
   { skip: process.env.RUN_WORKFLOW_CANARY !== "1" },
   async (t) => {
     const client = startClient();
     t.after(() => client.stop());
+    const deadline = Date.now() + 620_000;
 
-    await client.request("initialize", {
-      protocolVersion: "2025-06-18",
-      capabilities: {},
-      clientInfo: { name: "codex-workflow-canary", version: "1.0.0" },
+    await initialize(client);
+    const started = await client.request("tools/call", {
+      name: "WorkflowStart",
+      arguments: { cwd: repositoryRoot, script: canaryScript },
     });
-    client.notify("notifications/initialized");
-
-    const completed = await client.request(
-      "tools/call",
-      {
-        name: "Workflow",
-        arguments: { cwd: repositoryRoot, script: canaryScript },
-      },
-      620_000,
+    assertToolSuccess(started, "WorkflowStart");
+    const launch = parseToolPayload(started);
+    const completed = await pollWorkflowToTerminal(
+      client,
+      launch,
+      deadline,
     );
-    assertToolSuccess(completed, "Workflow");
 
-    const output = parseToolPayload(completed);
-    assert.equal(output.status, "completed");
+    assert.equal(completed.status, "completed");
+    assert.deepEqual(
+      [...new Set(completed.events.map((event) => event.role).filter(Boolean))].sort(),
+      ["architecture", "product", "synthesis"],
+    );
+    assert.deepEqual(
+      [...new Set(completed.events.map((event) => event.label).filter(Boolean))].sort(),
+      ["review-architecture", "review-product", "synthesize-reviews"],
+    );
+    assert.deepEqual(
+      [...new Set(completed.events.map((event) => event.phase).filter(Boolean))].sort(),
+      ["Review", "Synthesize"],
+    );
     for (const key of ["structure", "documentation", "synthesis"]) {
-      assert.notEqual(output.result[key], null);
-      assert.ok(output.result[key].summary.trim());
+      assert.notEqual(completed.result[key], null);
+      assert.ok(completed.result[key].summary.trim());
     }
   },
 );
