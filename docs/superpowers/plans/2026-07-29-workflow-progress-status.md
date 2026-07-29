@@ -49,6 +49,8 @@
   - `waitForStatus(run, afterRevision, waitMs): Promise<object>`
   - `stopWorkflow(run): object`
   - `snapshotRun(run, afterRevision, heartbeat): object`
+  - `appendEvent(run, event): void`
+  - `finishRun(run, status, terminalState?): boolean`
 
 - [ ] **Step 1: Make tool publication fail for the missing lifecycle tools**
 
@@ -70,6 +72,8 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   ]);
   assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
   assert.deepEqual(byName.WorkflowStatus.inputSchema.required, ["runId"]);
+  assert.equal(byName.WorkflowStatus.inputSchema.properties.afterRevision.default, 0);
+  assert.equal(byName.WorkflowStatus.inputSchema.properties.waitMs.default, 0);
   assert.equal(byName.WorkflowStatus.inputSchema.properties.waitMs.maximum, 20_000);
   assert.deepEqual(byName.WorkflowStop.inputSchema.required, ["runId"]);
 });
@@ -253,7 +257,9 @@ async function startWorkflow(nativeArguments, cwd) {
       terminal: false,
     };
     runs.set(run.runId, run);
-    void watchRun(run);
+    void watchRun(run).catch(() => {
+      finishRun(run, "failed");
+    });
     return run;
   } catch (error) {
     native.close();
@@ -269,12 +275,34 @@ from workflow duration.
 `parseNativeLaunch()` must retain the current checks for `async_launched`,
 `runId`, absolute `scriptPath`, and the `scripts` parent directory.
 
-The first watcher implementation only polls terminal state:
+Every terminal source uses one exactly-once transition:
+
+```js
+function appendEvent(run, event) {
+  run.revision += 1;
+  run.events.push({ revision: run.revision, ...event });
+}
+
+function finishRun(run, status, terminalState) {
+  if (run.terminal) return false;
+  run.terminal = true;
+  run.status = status;
+  run.terminalState = terminalState;
+  run.result = terminalState?.result;
+  appendEvent(run, { type: `workflow_${status}` });
+  run.close();
+  return true;
+}
+```
+
+The first watcher implementation only polls terminal state and rechecks the
+guard after each asynchronous operation:
 
 ```js
 async function watchRun(run) {
   while (!run.terminal) {
     const state = await readNativeState(run);
+    if (run.terminal) return;
     if (state) {
       finishFromNativeState(run, state);
       return;
@@ -300,11 +328,14 @@ function toolSuccess(value) {
 ```
 
 `WorkflowStart` returns `{runId, status: "starting", revision: 0, elapsedMs: 0}`.
-`WorkflowStatus` validates `runId`, integer `afterRevision >= 0`, and integer
-`waitMs` between `0` and `MAX_STATUS_WAIT_MS`, then waits until the revision
-changes, the run becomes terminal, or `waitMs` expires. `WorkflowStop` marks a
-running run as killed before closing its native child; repeated calls return
-the same snapshot.
+`WorkflowStatus` validates `runId`, then assigns
+`afterRevision = args.afterRevision ?? 0` and `waitMs = args.waitMs ?? 0`.
+Validate both as integers, require `afterRevision >= 0`, and bound `waitMs`
+between `0` and `MAX_STATUS_WAIT_MS`. Then wait until the revision changes, the
+run becomes terminal, or `waitMs` expires. Add a test that
+`WorkflowStatus({runId})` succeeds immediately with both defaults.
+`WorkflowStop` marks a running run as killed before closing its native child;
+repeated calls return the same snapshot.
 
 `finishFromNativeState()` stores the complete validated native state as
 `run.terminalState` and its user result separately as `run.result`.
@@ -323,6 +354,12 @@ async function runWorkflow(nativeArguments, cwd) {
 ```
 
 No workflow-duration deadline may appear in this path.
+
+`WorkflowStop`, valid native terminal state, unexpected child exit, watcher
+failure, and adapter shutdown must all call `finishRun()`. The first caller
+wins; later completions return the same immutable snapshot. A watcher must
+recheck `run.terminal` after journal reads, transcript reads, state reads, and
+poll delays so a completed read cannot overwrite an explicit stop.
 
 - [ ] **Step 9: Run the complete boundary suite**
 
@@ -475,7 +512,8 @@ transcript text in a returned error.
 
 For `started`, create a leaf record and `leaf_started`. For `result`, close the
 same leaf and emit `leaf_completed` when `result !== null`, otherwise
-`leaf_failed`. Each append increments `run.revision` exactly once:
+`leaf_failed`. Reuse Task 1's `appendEvent()` so each append increments
+`run.revision` exactly once:
 
 ```js
 function appendEvent(run, event) {
@@ -484,10 +522,10 @@ function appendEvent(run, event) {
 }
 ```
 
-Set `currentPhase` from the newest started leaf. A terminal native state appends
-one of `workflow_completed`, `workflow_failed`, or `workflow_killed`, then
-closes the child. `snapshotRun()` returns only events whose revision is greater
-than `afterRevision`.
+Set `currentPhase` from the newest started leaf. A terminal native state calls
+`finishRun()` with `completed`, `failed`, or `killed`; that single guarded path
+appends the matching terminal event and closes the child. `snapshotRun()`
+returns only events whose revision is greater than `afterRevision`.
 
 - [ ] **Step 6: Implement heartbeat and timing fields**
 
@@ -516,6 +554,10 @@ Add tests with exact assertions:
 - a run with no journal/state returns `heartbeat: true` after `waitMs: 10`;
 - `WorkflowStop` emits `workflow_killed`, terminates the fake child, and is
   idempotent;
+- a fake state read released after `WorkflowStop` cannot replace `killed`;
+  exactly one terminal workflow event remains;
+- malformed journal/state input produces one safe `workflow_failed`; a second
+  run on the same MCP server still completes;
 - closing adapter input still terminates every active fake child;
 - an unexpected fake child exit produces `workflow_failed`.
 
@@ -584,9 +626,13 @@ minimal guidance added next.
 
 - [ ] **Step 3: Create the complete adapted Claude Workflow reference**
 
-Create `skills/native-workflow/references/claude-workflows.md` from the bundled
-Claude Code 2.1.204 runtime guidance. `SKILL.md` will require reading this file
-before generating any workflow. Cover the universal API and behavior:
+Create `skills/native-workflow/references/claude-workflows.md` from the
+versioned runtime guidance in
+`/home/dirard/.local/share/claude/versions/2.1.204`. Preserve the source
+Workflow section order — purpose/invocation, `meta`, hooks, script runtime,
+pipeline-vs-barrier, limits, canonical patterns, quality patterns, resume —
+while applying the plugin deltas below. `SKILL.md` will require reading this
+file before generating any workflow. Cover the universal API and behavior:
 
 - pure-literal `meta` with required `name`/`description`, optional
   `whenToUse`/`phases`, and exact phase-title matching;
@@ -606,7 +652,8 @@ before generating any workflow. Cover the universal API and behavior:
   and 4096 items per `parallel()`/`pipeline()` call;
 - general compositions: fan-out/fan-in, map/reduce, multi-stage pipelines,
   conditional branches, loop-until-count, loop-until-budget, loop-until-dry,
-  judge panels, adversarial verification, and completeness critics.
+  judge panels, adversarial verification, perspective-diverse verification,
+  multi-modal sweep, and completeness critics.
 
 Mark the plugin deltas explicitly:
 
@@ -814,7 +861,37 @@ git rev-parse HEAD
 Expected: clean tree on `main`; ordinary suite, live canary, validators, syntax,
 and diff checks all pass.
 
-- [ ] **Step 2: Push the verified commit**
+- [ ] **Step 2: Refresh the personal marketplace source from the candidate commit**
+
+```bash
+release_commit=$(git rev-parse HEAD)
+release_stage_dir=$(mktemp -d)
+git archive --format=tar "$release_commit" | tar -xf - -C "$release_stage_dir"
+plugin_source=/home/dirard/plugins/codex-dynamic-workflow-plugin
+test "$(realpath "$plugin_source")" = "$plugin_source"
+rsync -a --delete --exclude '.env' --exclude '.git' "$release_stage_dir/" "$plugin_source/"
+python3 "$CODEX_HOME/skills/.system/plugin-creator/scripts/validate_plugin.py" "$plugin_source"
+```
+
+Expected: the personal marketplace source contains the exact candidate archive,
+preserves every `.env`, and validates as version `0.2.0`. Do not edit
+`marketplace.json` or global Codex config by hand.
+
+- [ ] **Step 3: Reinstall and verify the cached plugin**
+
+Read the marketplace name with the plugin-creator helper, then run:
+
+```bash
+plugin_marketplace_name=$(python3 "$CODEX_HOME/skills/.system/plugin-creator/scripts/read_marketplace_name.py")
+codex plugin add "codex-dynamic-workflow-plugin@$plugin_marketplace_name" --json
+codex plugin list
+```
+
+Validate the exact installed cache path returned by the install command and run
+its non-canary boundary suite. Confirm `.env` still exists only under the
+configured user config directory with mode `600`; never print its values.
+
+- [ ] **Step 4: Push the installed and verified commit**
 
 ```bash
 git push origin main
@@ -822,16 +899,16 @@ git push origin main
 
 Expected: `origin/main` advances to the verified commit without force-push.
 
-- [ ] **Step 3: Create and publish the annotated tag**
+- [ ] **Step 5: Create and publish the annotated tag**
 
 ```bash
 git tag -a v0.2.0 -m "v0.2.0"
 git push origin v0.2.0
 ```
 
-Expected: local and remote tag resolve to the verified commit.
+Expected: local and remote tag resolve to the installed candidate commit.
 
-- [ ] **Step 4: Create the GitHub Release**
+- [ ] **Step 6: Create the GitHub Release**
 
 Create a non-draft, non-prerelease GitHub Release with `gh release create`,
 title `v0.2.0 — observable workflow progress`, and notes that mention:
@@ -845,35 +922,6 @@ title `v0.2.0 — observable workflow progress`, and notes that mention:
 - no async execution deadline;
 - adapted Claude Workflow instructions;
 - unchanged Claude leaf tool-permission caveat.
-
-- [ ] **Step 5: Refresh the personal marketplace source from the release tag**
-
-Replace the files under
-`/home/dirard/plugins/codex-dynamic-workflow-plugin` with the exact
-`git archive v0.2.0` contents while excluding `.git` and every `.env`. Do not
-edit `marketplace.json` or global Codex config by hand.
-
-Validate the copied source:
-
-```bash
-python3 "$CODEX_HOME/skills/.system/plugin-creator/scripts/validate_plugin.py" /home/dirard/plugins/codex-dynamic-workflow-plugin
-```
-
-Expected: plugin validation passes with version `0.2.0`.
-
-- [ ] **Step 6: Reinstall and verify the cached plugin**
-
-Read the marketplace name with the plugin-creator helper, then run:
-
-```bash
-plugin_marketplace_name=$(python3 "$CODEX_HOME/skills/.system/plugin-creator/scripts/read_marketplace_name.py")
-codex plugin add "codex-dynamic-workflow-plugin@$plugin_marketplace_name" --json
-codex plugin list
-```
-
-Validate the exact installed cache path returned by the install command and run
-its non-canary boundary suite. Confirm `.env` still exists only under the
-configured user config directory with mode `600`; never print its values.
 
 - [ ] **Step 7: Verify release identity**
 

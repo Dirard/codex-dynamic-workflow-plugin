@@ -81,8 +81,9 @@ Tool не возвращает `runId`, пока внутренний MCP handsh
 }
 ```
 
-`waitMs` ограничен диапазоном от 0 до 20 000 мс. Это ограничение одного
-long-poll, а не workflow.
+`afterRevision` и `waitMs` необязательны; handler использует соответственно
+`0` и `0`. `waitMs` ограничен диапазоном от 0 до 20 000 мс. Это ограничение
+одного long-poll, а не workflow.
 
 Ответ:
 
@@ -176,7 +177,8 @@ Review-cycle — один из recipes, а не назначение плаги�
 универсальным и перед построением любого script требует прочитать bundled
 reference, адаптированный из инструкций Claude Code 2.1.204.
 
-Reference покрывает:
+Reference следует по порядку Workflow-разделу, извлечённому из versioned
+runtime `/home/dirard/.local/share/claude/versions/2.1.204`, и покрывает:
 
 - pure-literal `meta`, точные `phases` и plain JavaScript async body;
 - полные доступные hooks: `agent()`, `pipeline()`, `parallel()`, `log()`,
@@ -186,7 +188,8 @@ Reference покрывает:
 - `pipeline()` как default и точные случаи, когда нужен barrier `parallel()`;
 - native concurrency/agent/item limits;
 - loops, fan-out/fan-in, map/reduce, judge panels, adversarial verification,
-  multi-modal sweep и loop-until-dry как composable examples;
+  multi-modal sweep, completeness critic и loop-until-dry как composable
+  examples;
 - различия плагина: script передаётся inline, Codex задаёт весь DAG,
   `model`/`effort`/custom `agentType` не указываются, а resume by `scriptPath`
   не публикуется MCP wrapper версии 0.2.0;
@@ -258,16 +261,21 @@ MCP server хранит running records в памяти процесса. Каж
 проверенный native `runId`, производные пути, child process, время запуска,
 journal events и terminal snapshot.
 
-Фоновый watcher:
+Все источники завершения проходят через один guarded terminal transition,
+который сохраняет первый terminal snapshot и игнорирует последующие. Фоновый
+watcher:
 
 1. читает append-only journal;
 2. создаёт revisioned leaf events;
 3. читает terminal state;
 4. сохраняет result и закрывает native child при terminal state.
 
-Watcher не завершает workflow по времени. Отдельные 15-секундные таймауты
-остаются только у inner MCP handshake и launch request. При закрытии stdin
-внешнего MCP server все running children завершаются.
+После каждого асинхронного чтения watcher повторно проверяет terminal flag.
+Ошибки watcher и неожиданный exit child превращаются в безопасный
+`workflow_failed`, а не в unhandled rejection MCP server. Watcher не завершает
+workflow по времени. Отдельные 15-секундные таймауты остаются только у inner
+MCP handshake и launch request. При закрытии stdin внешнего MCP server все
+running children завершаются.
 
 Пути journal и state всегда выводятся из валидированного native `scriptPath`.
 `WorkflowStatus` и `WorkflowStop` принимают только `runId`, а не путь.
@@ -295,6 +303,9 @@ Watcher не завершает workflow по времени. Отдельные
 - Отдельный тест подтверждает отсутствие prompt, leaf result и filesystem paths
   в non-terminal status.
 - Проверяются повторный `WorkflowStop`, unexpected child exit и shutdown cleanup.
+- Проверяются race `WorkflowStop` с готовым native state и ошибки чтения
+  journal/state: terminal event остаётся exactly-once, MCP server продолжает
+  обслуживать другие runs.
 - Существующие синхронные boundary-tests остаются зелёными.
 - Live GLM canary наблюдает два независимых prompt-based reviewer leaf, затем
   synthesis leaf и final non-empty result через асинхронный путь.
@@ -303,9 +314,9 @@ Watcher не завершает workflow по времени. Отдельные
 ## Доставка
 
 После зелёных проверок версия повышается до `0.2.0`. Personal marketplace source
-обновляется штатным reinstall flow, установленная копия проверяется отдельно,
-затем `main`, tag `v0.2.0` и GitHub Release публикуются из одного проверенного
-commit.
+обновляется из точного release-candidate `HEAD` штатным reinstall flow,
+установленная копия проверяется отдельно, затем тот же commit публикуется как
+`main`, tag `v0.2.0` и GitHub Release.
 
 ## Не входит в версию 0.2.0
 
