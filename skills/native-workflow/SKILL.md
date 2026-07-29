@@ -16,13 +16,11 @@ Codex определяет весь workflow. GLM-5.2 выполняет тол�
    imports, Node.js API, `Date.now()` и `Math.random()`.
 3. Не указывать `model` или нестандартный `agentType`: leaf agents наследуют
    `glm-5.2` из MCP session.
-4. Вызвать `claude-workflow:Workflow` с точным `script`; не передавать свободный
-   goal вместо script.
-5. Получить background `task_id`. Если пользователь явно не запросил фоновый
-   запуск, дождаться завершения через
-   `claude-workflow:TaskOutput({ task_id, block: true, timeout: 600000 })`.
-6. Проверить completed result и каждый leaf output. Только Codex решает, нужен
-   ли следующий workflow.
+4. Вызвать `claude-workflow:Workflow` с абсолютным `cwd` текущего workspace и
+   точным `script`; не передавать свободный goal вместо script.
+5. Дождаться синхронного ответа wrapper и проверить `status: "completed"`,
+   `result` и каждый leaf output. Только Codex решает, нужен ли следующий
+   workflow.
 
 ```js
 export const meta = {
@@ -68,16 +66,16 @@ const synthesis = await agent(
 return { architecture, tests, synthesis };
 ```
 
-## Lifecycle
+## Вызов
 
-| Действие | Tool и аргументы |
-|---|---|
-| Inline запуск | `claude-workflow:Workflow({ script, args })` |
-| Сохранённый workflow | `claude-workflow:Workflow({ name, args })` |
-| Статус | `claude-workflow:TaskOutput({ task_id, block: false, timeout: 0 })` |
-| Ожидание | `claude-workflow:TaskOutput({ task_id, block: true, timeout: 600000 })` |
-| Отмена | `claude-workflow:TaskStop({ task_id })` |
+Использовать `claude-workflow:Workflow({ cwd, script, args? })`. Wrapper запускает
+native Claude Code Workflow в `cwd`, дожидается terminal metadata и возвращает
+результат одним MCP-вызовом.
 
-Если `Workflow` недоступен, возвращает `isError` или любой leaf output равен
-`null`, сообщить ошибку. Не заменять вызов свободным промптом, который отдаёт
-планирование GLM.
+До первого запуска настроить `ANTHROPIC_BASE_URL` и
+`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` в окружении Codex либо в
+`${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env`.
+
+Если `Workflow` недоступен, возвращает `isError`, terminal status не
+`completed` или любой leaf output равен `null`, сообщить ошибку. Не заменять
+вызов свободным промптом, который отдаёт планирование GLM.

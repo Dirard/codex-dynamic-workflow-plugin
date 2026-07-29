@@ -7,9 +7,9 @@ dependencies:
   tools:
     - type: "mcp"
       value: "claude-workflow"
-      description: "Bundled Claude Code Dynamic Workflow MCP server"
+      description: "Bundled synchronous Claude Code Dynamic Workflow wrapper"
       transport: "stdio"
-      command: "claude"
+      command: "node"
 
 policy:
   allow_implicit_invocation: false
