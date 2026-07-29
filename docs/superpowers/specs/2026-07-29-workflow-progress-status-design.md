@@ -168,7 +168,9 @@ function leaf(phaseName, role, label, prompt, options = {}) {
 Status reader принимает только `agentId` из безопасного single-segment
 алфавита, проверяет принадлежность вычисленного transcript path каталогу
 текущего run и извлекает строгую progress-метку только из первой user-записи
-agent transcript. Assistant/tool records не сканируются. Prompt, transcript,
+agent transcript. Первая запись читается до завершающего newline с жёстким
+пределом 16 MiB, а не фиксированным 8 KiB prefix, поэтому подробные prompts не
+теряют metadata. Assistant/tool records не сканируются. Prompt, transcript,
 leaf result и filesystem paths не возвращаются. Некорректная, отсутствующая
 или слишком длинная метка даёт `label: "leaf-<id>"`, `phase: null` и
 `role: null`, не прерывая native workflow; небезопасный `agentId` безопасно
@@ -271,7 +273,8 @@ watcher:
 1. читает append-only journal;
 2. создаёт revisioned leaf events;
 3. читает terminal state;
-4. сохраняет result и закрывает native child при terminal state.
+4. при terminal state ещё раз дочитывает journal и только после обработки
+   финальных leaf events сохраняет result и закрывает native child.
 
 После каждого асинхронного чтения watcher повторно проверяет terminal flag.
 Ошибки watcher и неожиданный exit child превращаются в безопасный
@@ -312,6 +315,9 @@ running children завершаются.
 - Проверяются traversal в `agentId`, marker только в assistant/tool record и
   отсутствие prompt/result/path в отдельном non-terminal snapshot после
   `leaf_completed`.
+- Проверяются user-запись длиннее 8 KiB и terminal race, в котором финальный
+  journal result появляется после обычного journal read, но до terminal
+  transition; leaf event не теряется.
 - Существующие синхронные boundary-tests остаются зелёными.
 - Live GLM canary наблюдает два независимых prompt-based reviewer leaf, затем
   synthesis leaf и final non-empty result через асинхронный путь.

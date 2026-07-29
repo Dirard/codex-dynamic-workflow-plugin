@@ -112,6 +112,7 @@ In `scripts/workflow-mcp.mjs`, replace `WORKFLOW_TIMEOUT_MS` with:
 const SERVER_VERSION = "0.2.0";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_STATUS_WAIT_MS = 20_000;
+const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const POLL_INTERVAL_MS = 250;
 const runs = new Map();
 ```
@@ -511,13 +512,15 @@ Before constructing a path, require `agentId` to match
 `transcriptRoot` and require `dirname(candidate) === resolvedTranscriptRoot`;
 otherwise fail safely without reading a file.
 
-Read at most 8 KiB from that file, parse complete JSONL records in order, and
-select only the first record whose `type === "user"` and
-`message.role === "user"`. Take text from a string `message.content` or from
-its `{type: "text", text}` blocks. Search the strict marker only in that user
-text, then parse the embedded object. Never scan assistant or tool records.
-Accept only plain objects whose `phase`, `role`, and `label` are strings from 1
-to 80 characters.
+Read the transcript incrementally until the newline ending the first user
+record, bounded by `MAX_TRANSCRIPT_PREFIX_BYTES` (16 MiB, above the native
+inline prompt envelope). Parse complete JSONL records in order and select only
+the first record whose `type === "user"` and `message.role === "user"`. Take
+text from a string `message.content` or from its `{type: "text", text}` blocks.
+Search the strict marker only in that user text, then parse the embedded
+object. Never scan assistant or tool records. If no complete first user record
+fits within the cap, use fallback metadata. Accept only plain objects whose
+`phase`, `role`, and `label` are strings from 1 to 80 characters.
 
 ```js
 const PROGRESS_PATTERN =
@@ -551,9 +554,15 @@ function appendEvent(run, event) {
 ```
 
 Set `currentPhase` from the newest started leaf. A terminal native state calls
-`finishRun()` with `completed`, `failed`, or `killed`; that single guarded path
-appends the matching terminal event and closes the child. `snapshotRun()`
-returns only events whose revision is greater than `afterRevision`.
+`finishFromNativeState()`. Before the guarded terminal transition, that
+function performs one final `readJournalAdditions()` and processes those
+events, rechecking `run.terminal` after every awaited read and transcript
+parse. Only then does it call `finishRun()` with `completed`, `failed`, or
+`killed`; that single guarded path appends the matching terminal event and
+closes the child. Native ordering writes final journal results before terminal
+state, so this final drain cannot lose a completed/failed leaf.
+`snapshotRun()` returns only events whose revision is greater than
+`afterRevision`.
 
 - [ ] **Step 6: Implement heartbeat and timing fields**
 
@@ -582,6 +591,8 @@ Add tests with exact assertions:
   reading outside `transcriptRoot`;
 - a valid marker present only in a later assistant/tool transcript record is
   ignored and produces fallback metadata;
+- a valid first user record larger than 8 KiB still yields its tracked
+  phase/role/label;
 - `result: null` produces one `leaf_failed` and `counts.failed === 1`;
 - a run with no journal/state returns `heartbeat: true` after `waitMs: 10`;
 - `WorkflowStop` emits `workflow_killed`, terminates the fake child, and is
@@ -592,6 +603,15 @@ Add tests with exact assertions:
   run on the same MCP server still completes;
 - closing adapter input still terminates every active fake child;
 - an unexpected fake child exit produces `workflow_failed`.
+
+Reuse one boundary-only file gate, enabled solely by
+`CODEX_WORKFLOW_TEST_GATE_DIR`, for the two interleaving tests. With the
+variable absent the watcher takes no gate branch. For the terminal-drain case,
+pause after the ordinary journal read, append the leaf `result` and terminal
+state, then release the watcher; assert `leaf_completed` precedes
+`workflow_completed`, `counts.active === 0`, and exactly one terminal event.
+Use the same gate to release a native state read after `WorkflowStop` in the
+stop-wins test.
 
 - [ ] **Step 9: Run the complete boundary suite**
 
