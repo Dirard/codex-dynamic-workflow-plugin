@@ -256,7 +256,7 @@ progress только `WorkflowWait`.
 ## 10. Resume и различия плагина
 
 Native Claude Workflow умеет resume по `scriptPath` и `resumeFromRunId`, кешируя
-неизменившийся prefix `agent()` calls. Wrapper версии `0.3.0` не публикует эти
+неизменившийся prefix `agent()` calls. Wrapper версии `0.3.1` не публикует эти
 outer inputs: передавать exact inline `script` в новый `WorkflowStart`.
 Не пытаться читать native journal или transcript напрямую — wrapper возвращает
 безопасный normalized status.

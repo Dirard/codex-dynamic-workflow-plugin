@@ -45,8 +45,11 @@ real JSON в `args`. Не использовать imports, Node API, clocks/ran
 
 ## Запуск и ожидание
 
+`script` — точный исполняемый JavaScript-сценарий, который уже построил Codex,
+а не текст задания на естественном языке.
+
 1. Вызвать `claude-workflow:WorkflowStart({ cwd, script, args? })` с абсолютным
-   `cwd` и точным inline script.
+   `cwd` и этим точным inline script.
 2. Сразу сообщить пользователю `runId` и первую запланированную phase.
 3. Вызвать
    `claude-workflow:WorkflowWait({ runId, afterRevision })`, передав последний

@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.3.1";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -36,6 +36,8 @@ const workflowInputSchema = {
     },
     script: {
       type: "string",
+      description:
+        "Exact Claude Code Dynamic Workflow JavaScript source. Do not pass a natural-language task.",
       minLength: 1,
       maxLength: MAX_SCRIPT_LENGTH,
     },
@@ -47,7 +49,8 @@ const workflowInputSchema = {
 
 const workflowStartTool = {
   name: "WorkflowStart",
-  description: "Start a Claude Code Dynamic Workflow in a workspace.",
+  description:
+    "Start an exact JavaScript Claude Code Dynamic Workflow in a workspace.",
   inputSchema: workflowInputSchema,
 };
 
@@ -225,7 +228,8 @@ async function handleMessage(message) {
           version: SERVER_VERSION,
         },
         instructions:
-          "Use WorkflowStart, then call WorkflowWait with the latest revision until terminal. " +
+          "Pass exact Dynamic Workflow JavaScript, never a natural-language task, to WorkflowStart. " +
+          "Then call WorkflowWait with the latest revision until terminal. " +
           "Report phase/role/leaf changes. Use WorkflowStop when the run is cancelled.",
       });
       return;
@@ -523,7 +527,17 @@ function startNativeClient(cwd) {
 
 function parseNativeLaunch(nativeResult) {
   if (nativeResult?.isError) {
-    throw new Error("Claude Code rejected the workflow");
+    const reason = nativeResult?.content
+      ?.find(
+        (item) =>
+          item?.type === "text" &&
+          typeof item.text === "string" &&
+          item.text.trim(),
+      )
+      ?.text.trim();
+    throw new Error(
+      reason?.slice(0, 2048) || "Claude Code rejected the workflow",
+    );
   }
   const text = nativeResult?.content?.find(
     (item) => item?.type === "text",

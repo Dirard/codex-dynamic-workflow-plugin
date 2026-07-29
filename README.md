@@ -33,13 +33,15 @@ chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env"
 
 ## Использование
 
-После установки плагина явно вызовите:
+Для запросов на Claude Code Dynamic Workflow или multi-agent orchestration
+Codex может активировать навык автоматически. Явный вариант остаётся доступен:
 
 ```text
 $codex-dynamic-workflow-plugin:native-workflow
 ```
 
-Codex сформирует script, передаст абсолютный путь текущего workspace в `cwd`,
+Codex сформирует точный исполняемый JavaScript `script` (не текст задания),
+передаст абсолютный путь текущего workspace в `cwd`,
 вызовет `WorkflowStart`, а затем `WorkflowWait` с последним `revision`. Wait
 возвращается только после реального изменения phase/role/leaf или terminal
 state; периодические пустые ответы и polling по таймеру отсутствуют.

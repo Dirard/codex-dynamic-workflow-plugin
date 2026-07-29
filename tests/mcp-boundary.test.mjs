@@ -403,6 +403,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     process.env.FAKE_WORKFLOW_PROGRESS === "1" ? "progress" : readMode();
   const agentId = process.env.FAKE_WORKFLOW_AGENT_ID || "agentone";
 
+  if (mode === "rejected") {
+    respond(message.id, {
+      content: [
+        { type: "text", text: "  " },
+        { type: "text", text: "Workflow script must be JavaScript" },
+      ],
+      isError: true,
+    });
+    return;
+  }
+
   if (
     [
       "progress",
@@ -674,6 +685,14 @@ test("plugin starts its bundled native-workflow adapter", () => {
   assert.equal(server.tool_timeout_sec, 31_536_000);
 });
 
+test("native-workflow allows implicit invocation", async () => {
+  const config = await readFile(
+    new URL("../skills/native-workflow/agents/openai.yaml", import.meta.url),
+    "utf8",
+  );
+  assert.match(config, /allow_implicit_invocation:\s*true/);
+});
+
 function startClient(env = {}) {
   const child = spawn(server.command, server.args, {
     cwd: repositoryRoot,
@@ -761,11 +780,30 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
     "WorkflowWait",
   ]);
   assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
+  assert.match(byName.WorkflowStart.description, /exact JavaScript/i);
+  assert.match(
+    byName.WorkflowStart.inputSchema.properties.script.description,
+    /not.*natural-language task/i,
+  );
   assert.deepEqual(byName.WorkflowWait.inputSchema.required, [
     "runId",
     "afterRevision",
   ]);
   assert.deepEqual(byName.WorkflowStop.inputSchema.required, ["runId"]);
+});
+
+test("WorkflowStart preserves Claude Code's rejection reason", async (t) => {
+  const { client } = await startFakeModeClient(t, "rejected");
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script: "This is not JavaScript",
+    },
+  });
+
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, "Workflow script must be JavaScript");
 });
 
 test("Workflow refuses to fall back when Z.AI provider env is missing", async (t) => {
