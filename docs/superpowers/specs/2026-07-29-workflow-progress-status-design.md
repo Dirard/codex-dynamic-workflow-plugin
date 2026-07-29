@@ -1,0 +1,253 @@
+# Codex Dynamic Workflow Plugin — статус выполнения
+
+## Цель
+
+Codex должен сразу получать идентификатор запущенного Claude Code Dynamic
+Workflow, видеть фактические переходы leaf-задач и регулярно сообщать
+пользователю, что работа продолжается. Большой workflow не должен завершаться
+из-за общего временного лимита.
+
+Codex остаётся оркестратором: он строит DAG, формирует точный JavaScript,
+запускает workflow, интерпретирует статус и решает, что делать после terminal
+result. GLM-5.2 выполняет только leaf-вызовы `agent()`.
+
+## Проверенные ограничения
+
+- Текущий MCP tool `Workflow` блокирует Codex до terminal result и скрывает
+  промежуточное состояние.
+- Актуальный Codex manual описывает MCP tools, но не гарантирует передачу
+  progress notifications в контекст модели или интерфейс задачи.
+- Claude Code 2.1.204 через `claude mcp serve` не отправляет progress
+  notifications даже при переданном MCP `progressToken`.
+- Native `<runId>.json` появляется с terminal state, а
+  `subagents/workflows/<runId>/journal.jsonl` обновляется во время выполнения
+  событиями `started` и `result`.
+
+Поэтому статус строится на асинхронном MCP lifecycle и нативном journal, а не
+на неподтверждённых progress notifications.
+
+## Пользовательское поведение
+
+1. Codex вызывает `WorkflowStart` и сразу получает `runId`.
+2. Codex сообщает пользователю, что workflow запущен и какая phase начинается.
+3. Codex вызывает `WorkflowStatus` с long-poll до 20 секунд.
+4. При изменении Codex сообщает новую phase и started/completed/failed leaf.
+5. Если изменений нет, Codex раз в 20 секунд даёт короткий heartbeat.
+6. После terminal status Codex проверяет result и сам принимает следующее
+   оркестрационное решение.
+7. При отмене или замене задачи Codex вызывает `WorkflowStop`.
+
+Общего execution deadline нет. Workflow работает до native terminal state,
+явного `WorkflowStop` или завершения MCP-процесса.
+
+## MCP tools
+
+### `WorkflowStart`
+
+Вход остаётся совместимым с текущим запуском:
+
+```json
+{
+  "cwd": "/absolute/workspace",
+  "script": "self-contained JavaScript",
+  "args": {}
+}
+```
+
+`args` необязателен. Успешный ответ:
+
+```json
+{
+  "runId": "wf_...",
+  "status": "starting",
+  "revision": 0,
+  "elapsedMs": 0
+}
+```
+
+Tool не возвращает `runId`, пока внутренний MCP handshake и native launch не
+прошли проверку.
+
+### `WorkflowStatus`
+
+Вход:
+
+```json
+{
+  "runId": "wf_...",
+  "afterRevision": 0,
+  "waitMs": 20000
+}
+```
+
+`waitMs` ограничен диапазоном от 0 до 20 000 мс. Это ограничение одного
+long-poll, а не workflow.
+
+Ответ:
+
+```json
+{
+  "runId": "wf_...",
+  "status": "running",
+  "revision": 1,
+  "heartbeat": false,
+  "elapsedMs": 12000,
+  "currentPhase": "Inspect",
+  "counts": {
+    "started": 1,
+    "active": 1,
+    "completed": 0,
+    "failed": 0
+  },
+  "activeLeaves": [
+    {
+      "id": "a1b2c3d4",
+      "phase": "Inspect",
+      "label": "inspect-readme",
+      "elapsedMs": 12000
+    }
+  ],
+  "events": [
+    {
+      "revision": 1,
+      "type": "leaf_started",
+      "id": "a1b2c3d4",
+      "phase": "Inspect",
+      "label": "inspect-readme"
+    }
+  ]
+}
+```
+
+`events` содержит только события после `afterRevision`. При отсутствии
+изменений tool возвращает тот же `revision`, пустой `events` и
+`heartbeat: true`. Terminal snapshot дополнительно содержит final `result`.
+
+Допустимые event types:
+
+- `leaf_started`
+- `leaf_completed`
+- `leaf_failed`
+- `workflow_completed`
+- `workflow_failed`
+- `workflow_killed`
+
+### `WorkflowStop`
+
+При running workflow завершает native child и возвращает terminal snapshot.
+Повторный вызов для terminal run возвращает уже сохранённый snapshot.
+
+### Совместимый `Workflow`
+
+Существующий синхронный tool остаётся для старых callers и использует тот же
+внутренний run engine. Обновлённый skill его не выбирает: большие задачи идут
+только через `WorkflowStart` и `WorkflowStatus`. Плагин не добавляет собственный
+execution deadline; внешний timeout синхронного caller не считается границей
+native workflow.
+
+## Источник phase и leaf metadata
+
+Journal содержит фактические `agentId`, `started` и `result`, но не сохраняет
+native `label` и `phase`. Для точного отображения обновлённый skill формирует
+каждый leaf через небольшой helper:
+
+```js
+function leaf(phaseName, label, prompt, options = {}) {
+  const progress = JSON.stringify({ phase: phaseName, label });
+  return agent(
+    `<codex-workflow-progress>${progress}</codex-workflow-progress>\n${prompt}`,
+    { ...options, label, phase: phaseName },
+  );
+}
+```
+
+Status reader извлекает только строгую progress-метку из первой user-записи
+agent transcript. Prompt, transcript, leaf result и filesystem paths не
+возвращаются. Некорректная, отсутствующая или слишком длинная метка даёт
+`label: "leaf-<id>"` и `phase: null`, не прерывая native workflow.
+
+## Адаптированные Claude Workflow instructions
+
+Skill сохраняет нативную модель Claude Code 2.1.204 и изменяет только слой,
+необходимый Codex:
+
+- self-contained plain JavaScript начинается с pure-literal `meta`;
+- `meta` содержит `name`, `description` и `phases`;
+- названия в `meta.phases`, `phase()` и leaf `phase` совпадают точно;
+- каждый leaf имеет стабильный `label` и создаётся через `leaf()`;
+- `parallel()` получает функции, а не готовые promises;
+- `pipeline()` используется для независимых стадий без лишнего barrier;
+- structured leaf возвращает объект через JSON Schema;
+- `args` передаётся как настоящее JSON-значение;
+- imports, Node.js API, `Date.now()`, `new Date()` и `Math.random()` не
+  используются;
+- Codex задаёт DAG, условия, prompts и schemas; GLM-5.2 не планирует workflow;
+- `log()` остаётся нативным диагностическим средством, но не считается
+  источником live status.
+
+Инструкции адаптируются по смыслу, а не копируют внутренний system prompt
+Claude Code целиком.
+
+## Внутренний lifecycle
+
+MCP server хранит running records в памяти процесса. Каждый record содержит
+проверенный native `runId`, производные пути, child process, время запуска,
+journal events и terminal snapshot.
+
+Фоновый watcher:
+
+1. читает append-only journal;
+2. создаёт revisioned leaf events;
+3. читает terminal state;
+4. сохраняет result и закрывает native child при terminal state.
+
+Watcher не завершает workflow по времени. Отдельные 15-секундные таймауты
+остаются только у inner MCP handshake и launch request. При закрытии stdin
+внешнего MCP server все running children завершаются.
+
+Пути journal и state всегда выводятся из валидированного native `scriptPath`.
+`WorkflowStatus` и `WorkflowStop` принимают только `runId`, а не путь.
+
+## Ошибки и безопасность
+
+- Неизвестный `runId` возвращает понятную MCP error.
+- Неожиданный exit Claude до terminal state создаёт `workflow_failed`.
+- Native `failed` и `killed` сохраняются как terminal snapshots.
+- Leaf с `null` result считается `leaf_failed`.
+- Ошибка чтения journal/state не раскрывает содержимое файлов или raw provider
+  response.
+- Progress metadata ограничивается короткими строками и строгой JSON-формой.
+- Credentials, prompts, outputs и transcript paths не входят в status events.
+- Граница permissions Claude Code и предупреждение про `Bash`/`Edit`/`Write`
+  остаются без изменений.
+
+## Проверка
+
+- Boundary-test проверяет публикацию `WorkflowStart`, `WorkflowStatus`,
+  `WorkflowStop` и совместимого `Workflow`.
+- Fake Claude подтверждает, что `WorkflowStart` возвращается до terminal state.
+- Инкрементальный fake journal проверяет revision, started/completed/failed
+  events, active counts, phase/label и heartbeat.
+- Отдельный тест подтверждает отсутствие prompt, leaf result и filesystem paths
+  в non-terminal status.
+- Проверяются повторный `WorkflowStop`, unexpected child exit и shutdown cleanup.
+- Существующие синхронные boundary-tests остаются зелёными.
+- Live GLM canary наблюдает два параллельных leaf, затем synthesis leaf и final
+  non-empty result через асинхронный путь.
+- Plugin и skill проходят штатные валидаторы.
+
+## Доставка
+
+После зелёных проверок версия повышается до `0.2.0`. Personal marketplace source
+обновляется штатным reinstall flow, установленная копия проверяется отдельно,
+затем `main`, tag `v0.2.0` и GitHub Release публикуются из одного проверенного
+commit.
+
+## Не входит в версию 0.2.0
+
+- отдельный watcher daemon;
+- восстановление run после перезапуска MCP server;
+- собственная база истории;
+- поток всех Claude logs в контекст Codex;
+- искусственный процент готовности;
+- общий execution deadline.
