@@ -692,35 +692,41 @@ git commit -m "docs: teach Codex to wait for workflow events"
 After all three tasks and checks are complete:
 
 1. Run one fresh blind final implementation review over the complete frozen
-   snapshot. Fix only valid blocking findings, then repeat within the allowed
-   review-cycle limit until blocking findings are zero or the limit is reached.
-2. Re-run `node --check`, the complete non-canary suite, both validators,
-   `git diff --check`, and `git status --short --branch`.
-3. Push the reviewed commit and create GitHub release `v0.3.0`:
+   snapshot. If it reports valid blocking findings, apply only those fixes,
+   run their narrow checks, and commit them before starting the next review
+   group:
 
    ```bash
-   git push origin main
-   reviewed_sha=$(git rev-parse HEAD)
-   gh release create v0.3.0 --target "$reviewed_sha" --title "v0.3.0" --notes "Replaces heartbeat polling and WorkflowStatus with event-driven WorkflowWait."
-   gh release view v0.3.0 --json tagName,targetCommitish,url
+   git add scripts/workflow-mcp.mjs tests/mcp-boundary.test.mjs .mcp.json .codex-plugin/plugin.json README.md skills/native-workflow/SKILL.md skills/native-workflow/references/claude-workflows.md docs/superpowers/specs/2026-07-29-workflow-event-wait-design.md docs/superpowers/plans/2026-07-29-workflow-event-wait.md
+   git commit -m "fix: address workflow wait review"
    ```
 
-   Expected: the release is published at the reviewed commit.
-4. Read the personal marketplace name with:
+   This exact allow-list contains only task-scoped files; do not use
+   `git add -A`. Repeat within the allowed review-cycle limit until blocking
+   findings are zero or the limit is reached. Do not publish or install a
+   worktree with uncommitted review fixes. If the hard-cap final self-review
+   makes a task-scoped fix, run its narrow check and commit it with the same
+   allow-list before integration.
 
-   ```bash
-   python3 /home/dirard/.codex/skills/.system/plugin-creator/scripts/read_marketplace_name.py
-   ```
-
-   Expected: `personal`. Its source is the separate deployment directory
-   `/home/dirard/plugins/codex-dynamic-workflow-plugin`, not this Git checkout.
-
-5. Build and validate an exact archive of the reviewed commit, then replace
-   only the confirmed marketplace source:
+2. After the final review group, run the complete verification, publication,
+   exact marketplace deployment, and installation in one shell so every
+   operation uses the same committed `reviewed_sha`:
 
    ```bash
    set -euo pipefail
+   test -z "$(git status --porcelain)"
    reviewed_sha=$(git rev-parse HEAD)
+   node --check scripts/workflow-mcp.mjs
+   node --test tests/mcp-boundary.test.mjs
+   python3 /home/dirard/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/native-workflow
+   python3 /home/dirard/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+   git diff --check v0.2.0 "$reviewed_sha"
+   RUN_WORKFLOW_CANARY=1 node --test tests/mcp-boundary.test.mjs
+   git push origin "$reviewed_sha:refs/heads/main"
+   gh release create v0.3.0 --target "$reviewed_sha" --title "v0.3.0" --notes "Replaces heartbeat polling and WorkflowStatus with event-driven WorkflowWait."
+   gh release view v0.3.0 --json tagName,targetCommitish,url
+   marketplace_name=$(python3 /home/dirard/.codex/skills/.system/plugin-creator/scripts/read_marketplace_name.py)
+   test "$marketplace_name" = "personal"
    deployment_root=$(mktemp -d /home/dirard/plugins/codex-dynamic-workflow-plugin.deploy.XXXXXX)
    mkdir "$deployment_root/source"
    git archive --format=tar --output="$deployment_root/plugin.tar" "$reviewed_sha"
@@ -736,20 +742,19 @@ After all three tasks and checks are complete:
    mv "$deployment_root/source" "$marketplace_source"
    rm "$deployment_root/plugin.tar"
    rmdir "$deployment_root"
+   codex plugin add "codex-dynamic-workflow-plugin@$marketplace_name"
+   installed_plugin=/home/dirard/.codex/plugins/cache/personal/codex-dynamic-workflow-plugin/0.3.0
+   test -f "$installed_plugin/.codex-plugin/plugin.json"
+   node -e 'const m = require(process.argv[1]); if (m.version !== "0.3.0") process.exit(1)' "$installed_plugin/.codex-plugin/plugin.json"
+   node -e 'const c = require(process.argv[1]); if (c.mcpServers["claude-workflow"].tool_timeout_sec !== 31536000) process.exit(1)' "$installed_plugin/.mcp.json"
+   node --test "$installed_plugin/tests/mcp-boundary.test.mjs"
+   test -z "$(git status --porcelain)"
+   printf 'reviewed commit: %s\n' "$reviewed_sha"
    ```
 
-   Expected: validation PASS, the new marketplace source contains manifest
-   version `0.3.0`, and the printed `deployment_backup` retains the old `0.2.0`
-   deployment. Recovery is moving that backup back to `marketplace_source`.
+   Expected: all checks and live canary PASS; release `v0.3.0` targets the
+   printed `reviewed_sha`; the recoverable backup path is printed; installed
+   tests confirm `WorkflowWait` is published and `WorkflowStatus` is absent.
 
-6. Reinstall the versioned local plugin:
-
-   ```bash
-   codex plugin add codex-dynamic-workflow-plugin@personal
-   ```
-
-7. Verify the installed cache contains version `0.3.0`, its `.mcp.json` has
-   `tool_timeout_sec: 31536000`, and its server publishes `WorkflowWait` but not
-   `WorkflowStatus`.
-8. Test the newly installed MCP tools from a new Codex task, because the
+3. Test the newly installed MCP tools from a new Codex task, because the
    current task does not reload plugin tool definitions in place.
