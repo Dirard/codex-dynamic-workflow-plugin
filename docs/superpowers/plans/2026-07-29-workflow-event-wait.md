@@ -274,9 +274,18 @@ const waiting = client.request(
 await assertPending(waiting);
 ```
 
-After writing the transcript/state and releasing the gate, use
-`const snapshot = parseToolPayload(await waiting);` and keep the existing exact
-event, revision, redaction, and count assertions.
+After writing the transcript/state and releasing the gate, consume the first
+real update, then continue the normal revisioned collection from revision `0`:
+
+```js
+const first = parseToolPayload(await waiting);
+assert.ok(first.revision > 0);
+const snapshot = await collectWorkflowEvents(client, launch.runId);
+```
+
+Keep the existing exact terminal event, revision, redaction, and count
+assertions on `snapshot`. The first Wait is allowed to return a running
+`leaf_started` snapshot; the test must not delay that response until terminal.
 
 - [ ] **Step 6: Replace polling validation with strict Wait validation**
 
@@ -613,7 +622,7 @@ Use:
 Codex сформирует script, передаст абсолютный путь текущего workspace в `cwd`,
 вызовет `WorkflowStart`, а затем `WorkflowWait` с последним `revision`. Wait
 возвращается только после реального изменения phase/role/leaf или terminal
-state; heartbeat и polling по таймеру отсутствуют.
+state; периодические пустые ответы и polling по таймеру отсутствуют.
 
 У async path нет общего execution deadline. `WorkflowStop` явно отменяет run,
 будит pending Wait и возвращает killed state. Старый синхронный `Workflow`
