@@ -392,6 +392,8 @@ git commit -m "feat: add asynchronous workflow lifecycle"
 - Marker contract:
   - `<codex-workflow-progress>{"phase":"Inspect","role":"correctness","label":"inspect-readme"}</codex-workflow-progress>`
   - `phase`, `role`, and `label` are strings of 1–80 characters.
+  - Journal `agentId` must match `^[A-Za-z0-9_-]{1,128}$`; all other values
+    fail the run without attempting a transcript read.
 
 - [ ] **Step 1: Make incremental progress and redaction fail**
 
@@ -402,9 +404,11 @@ Teach the fake Claude process to create:
 <session>/subagents/workflows/wf_fixture/agent-agentone.jsonl
 ```
 
-For `FAKE_WORKFLOW_PROGRESS=1`, write the agent transcript first, append a
-`started` journal line, append a `result` line after 50 ms, and write terminal
-state after 100 ms. The transcript's first user prompt must contain the strict
+For `FAKE_WORKFLOW_PROGRESS=1`, write the agent transcript first and append a
+`started` journal line. In the progress test, gate the `result` journal line on
+`<stateRoot>/<runId>.release-result` and terminal state on
+`<stateRoot>/<runId>.release-state`; this makes the three snapshots
+deterministic. The transcript's first user prompt must contain the strict
 progress marker plus `SECRET_PROMPT_TEXT`; the journal result must contain
 `SECRET_LEAF_RESULT`.
 
@@ -412,7 +416,7 @@ Add a test that polls from the returned revision:
 
 ```js
 test("WorkflowStatus reports revisioned leaf progress without transcript data", async (t) => {
-  const client = await startFakeProgressClient(t);
+  const { client, stateRoot } = await startFakeProgressClient(t);
   const launch = await startFakeWorkflow(client);
 
   const running = parseToolPayload(await client.request("tools/call", {
@@ -429,7 +433,8 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
   assert.doesNotMatch(serialized, /SECRET_PROMPT_TEXT|SECRET_LEAF_RESULT/);
   assert.doesNotMatch(serialized, /subagents|journal\\.jsonl|agent-agentone/);
 
-  const completed = parseToolPayload(await client.request("tools/call", {
+  await writeFile(join(stateRoot, `${launch.runId}.release-result`), "");
+  const leafCompleted = parseToolPayload(await client.request("tools/call", {
     name: "WorkflowStatus",
     arguments: {
       runId: launch.runId,
@@ -437,9 +442,24 @@ test("WorkflowStatus reports revisioned leaf progress without transcript data", 
       waitMs: 1_000,
     },
   }));
-  assert.ok(completed.events.some((event) => event.type === "leaf_completed"));
-  assert.equal(completed.counts.active, 0);
-  assert.equal(completed.counts.completed, 1);
+  assert.ok(leafCompleted.events.some((event) => event.type === "leaf_completed"));
+  assert.equal(leafCompleted.status, "running");
+  assert.equal(leafCompleted.counts.active, 0);
+  assert.equal(leafCompleted.counts.completed, 1);
+  const completedSerialized = JSON.stringify(leafCompleted);
+  assert.doesNotMatch(completedSerialized, /SECRET_PROMPT_TEXT|SECRET_LEAF_RESULT/);
+  assert.doesNotMatch(completedSerialized, /subagents|journal\\.jsonl|agent-agentone/);
+
+  await writeFile(join(stateRoot, `${launch.runId}.release-state`), "");
+  const terminal = parseToolPayload(await client.request("tools/call", {
+    name: "WorkflowStatus",
+    arguments: {
+      runId: launch.runId,
+      afterRevision: leafCompleted.revision,
+      waitMs: 1_000,
+    },
+  }));
+  assert.equal(terminal.status, "completed");
 });
 ```
 
@@ -484,16 +504,24 @@ async function readJournalAdditions(run) {
 
 Do not reread old journal results on every 250 ms poll.
 
-- [ ] **Step 4: Parse only the progress marker from the transcript prefix**
+- [ ] **Step 4: Validate the transcript path and parse only the first user prompt**
 
-Read at most 8 KiB from `agent-<agentId>.jsonl`, locate the strict marker, decode
-the JSON-string escaping once, then parse the embedded object. Accept only
-plain objects whose `phase`, `role`, and `label` are strings from 1 to 80
-characters.
+Before constructing a path, require `agentId` to match
+`^[A-Za-z0-9_-]{1,128}$`. Resolve `agent-<agentId>.jsonl` under the resolved
+`transcriptRoot` and require `dirname(candidate) === resolvedTranscriptRoot`;
+otherwise fail safely without reading a file.
+
+Read at most 8 KiB from that file, parse complete JSONL records in order, and
+select only the first record whose `type === "user"` and
+`message.role === "user"`. Take text from a string `message.content` or from
+its `{type: "text", text}` blocks. Search the strict marker only in that user
+text, then parse the embedded object. Never scan assistant or tool records.
+Accept only plain objects whose `phase`, `role`, and `label` are strings from 1
+to 80 characters.
 
 ```js
 const PROGRESS_PATTERN =
-  /<codex-workflow-progress>(.{1,1024}?)<\\/codex-workflow-progress>/;
+  /<codex-workflow-progress>(.{1,1024}?)<\/codex-workflow-progress>/;
 
 function validateProgressMetadata(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -550,6 +578,10 @@ Expected: focused test passes; all non-canary tests pass.
 Add tests with exact assertions:
 
 - unknown `runId` and invalid `afterRevision`/`waitMs` return safe tool errors;
+- traversal or separator characters in journal `agentId` fail safely without
+  reading outside `transcriptRoot`;
+- a valid marker present only in a later assistant/tool transcript record is
+  ignored and produces fallback metadata;
 - `result: null` produces one `leaf_failed` and `counts.failed === 1`;
 - a run with no journal/state returns `heartbeat: true` after `waitMs: 10`;
 - `WorkflowStop` emits `workflow_killed`, terminates the fake child, and is
@@ -770,7 +802,11 @@ The live test must:
 7. assert the same three non-empty final structured outputs as version 0.1.0.
 
 Do not add an elapsed-time stop condition to the plugin. The test harness may
-retain its 620-second request timeout so CI cannot hang forever.
+retain its per-request timeout, but the canary polling loop must also own one
+620-second test-only deadline. Before each status call, bound `waitMs` by the
+remaining test time. If the deadline expires, call `WorkflowStop` in cleanup
+and fail the test so repeated 20-second heartbeats cannot keep CI alive
+forever.
 
 - [ ] **Step 6: Update metadata and user documentation**
 

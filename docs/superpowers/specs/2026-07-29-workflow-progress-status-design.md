@@ -165,11 +165,14 @@ function leaf(phaseName, role, label, prompt, options = {}) {
 }
 ```
 
-Status reader извлекает только строгую progress-метку из первой user-записи
-agent transcript. Prompt, transcript, leaf result и filesystem paths не
-возвращаются. Некорректная, отсутствующая или слишком длинная метка даёт
-`label: "leaf-<id>"`, `phase: null` и `role: null`, не прерывая native
-workflow.
+Status reader принимает только `agentId` из безопасного single-segment
+алфавита, проверяет принадлежность вычисленного transcript path каталогу
+текущего run и извлекает строгую progress-метку только из первой user-записи
+agent transcript. Assistant/tool records не сканируются. Prompt, transcript,
+leaf result и filesystem paths не возвращаются. Некорректная, отсутствующая
+или слишком длинная метка даёт `label: "leaf-<id>"`, `phase: null` и
+`role: null`, не прерывая native workflow; небезопасный `agentId` безопасно
+завершает run с ошибкой до чтения файла.
 
 ## Универсальные инструкции Claude Workflow
 
@@ -306,9 +309,14 @@ running children завершаются.
 - Проверяются race `WorkflowStop` с готовым native state и ошибки чтения
   journal/state: terminal event остаётся exactly-once, MCP server продолжает
   обслуживать другие runs.
+- Проверяются traversal в `agentId`, marker только в assistant/tool record и
+  отсутствие prompt/result/path в отдельном non-terminal snapshot после
+  `leaf_completed`.
 - Существующие синхронные boundary-tests остаются зелёными.
 - Live GLM canary наблюдает два независимых prompt-based reviewer leaf, затем
   synthesis leaf и final non-empty result через асинхронный путь.
+- Live canary имеет собственный общий 620-секундный test-only deadline и при
+  его исчерпании вызывает `WorkflowStop`; это не runtime deadline плагина.
 - Plugin и skill проходят штатные валидаторы.
 
 ## Доставка
