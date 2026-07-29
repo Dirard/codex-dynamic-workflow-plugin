@@ -40,13 +40,12 @@ $codex-dynamic-workflow-plugin:native-workflow
 ```
 
 Codex сформирует script, передаст абсолютный путь текущего workspace в `cwd`,
-вызовет `WorkflowStart`, а затем будет long-polling `WorkflowStatus` с последним
-`revision`. Один status call ждёт не более 20 секунд: если новых событий нет,
-возвращается heartbeat. Codex сообщает изменение phase, активную role и
-started/completed/failed leaf, пока workflow не станет terminal.
+вызовет `WorkflowStart`, а затем `WorkflowWait` с последним `revision`. Wait
+возвращается только после реального изменения phase/role/leaf или terminal
+state; периодические пустые ответы и polling по таймеру отсутствуют.
 
-У async path нет общего execution deadline. `WorkflowStop` явно отменяет run
-при запросе пользователя или замене задачи. Старый синхронный `Workflow`
+У async path нет общего execution deadline. `WorkflowStop` явно отменяет run,
+будит pending Wait и возвращает killed state. Старый синхронный `Workflow`
 сохранён только для совместимости.
 
 Bundled reference адаптирует native Claude Workflow guidance для произвольных

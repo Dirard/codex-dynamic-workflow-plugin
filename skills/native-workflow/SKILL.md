@@ -43,24 +43,24 @@ function leaf(phaseName, role, label, prompt, options = {}) {
 real JSON в `args`. Не использовать imports, Node API, clocks/randomness,
 `model`, `effort` или custom `agentType`.
 
-## Запуск и status loop
+## Запуск и ожидание
 
 1. Вызвать `claude-workflow:WorkflowStart({ cwd, script, args? })` с абсолютным
    `cwd` и точным inline script.
 2. Сразу сообщить пользователю `runId` и первую запланированную phase.
-3. Повторять
-   `claude-workflow:WorkflowStatus({ runId, afterRevision, waitMs: 20000 })`,
-   передавая последний полученный `revision`.
-4. Сообщать только новые phase/role/leaf events. При `heartbeat: true` кратко
-   подтвердить, что работа продолжается, и назвать активную phase/role.
+3. Вызвать
+   `claude-workflow:WorkflowWait({ runId, afterRevision })`, передав последний
+   полученный `revision`.
+4. После ответа сообщить только новые phase/role/leaf events и повторить
+   `WorkflowWait` с новой revision.
 5. Продолжать без общего deadline до `completed`, `failed` или `killed`.
 6. При отмене, замене задачи или явной команде пользователя вызвать
-   `claude-workflow:WorkflowStop({ runId })`.
+   `claude-workflow:WorkflowStop({ runId })`; pending Wait вернёт killed state.
 7. Проверить terminal result и каждый ожидаемый leaf output. Только Codex
    решает, нужен ли следующий workflow.
 
 Старый `Workflow` остаётся compatibility tool; для новых и больших задач его
-не выбирать. `log()` — native diagnostic, не замена `WorkflowStatus`.
+не выбирать. `log()` — native diagnostic, не замена `WorkflowWait`.
 
 Prompt-based read-only не является sandbox. Leaf может видеть `Bash`, `Edit` и
 `Write`; технические ограничения задаются permissions Claude Code или

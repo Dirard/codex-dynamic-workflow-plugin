@@ -245,18 +245,18 @@ thorough audit — больше независимых finders, 3–5 votes и c
 символов. `role` — произвольный стабильный идентификатор задачи, не только
 reviewer preset.
 
-Запускать `WorkflowStart`, затем повторять `WorkflowStatus` с последним
-`revision` и `waitMs: 20000`. Сообщать новые phase/role/leaf events; при
-`heartbeat: true` кратко сообщать, что работа продолжается. Общего execution
-deadline у async path нет. На отмену пользователя вызывать `WorkflowStop`.
+Запускать `WorkflowStart`, затем повторять `WorkflowWait` с последним
+`revision`. Wait возвращается только после новой revision или terminal state.
+Сообщать новые phase/role/leaf events. Общего execution deadline у async path
+нет. На отмену пользователя вызывать `WorkflowStop`; он будит pending Wait.
 
 `log()` остаётся полезен внутри native UI, но Codex считает источником live
-status только `WorkflowStatus`.
+progress только `WorkflowWait`.
 
 ## 10. Resume и различия плагина
 
 Native Claude Workflow умеет resume по `scriptPath` и `resumeFromRunId`, кешируя
-неизменившийся prefix `agent()` calls. Wrapper версии `0.2.0` не публикует эти
+неизменившийся prefix `agent()` calls. Wrapper версии `0.3.0` не публикует эти
 outer inputs: передавать exact inline `script` в новый `WorkflowStart`.
 Не пытаться читать native journal или transcript напрямую — wrapper возвращает
 безопасный normalized status.
