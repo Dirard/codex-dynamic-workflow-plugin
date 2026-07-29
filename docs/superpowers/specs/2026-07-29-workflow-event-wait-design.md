@@ -13,34 +13,19 @@ Codex по-прежнему строит DAG, запускает workflow, ин�
 ## Пользовательское поведение
 
 1. `WorkflowStart` сразу возвращает `runId` и начальный `revision`.
-2. `WorkflowStatus` при необходимости мгновенно возвращает текущий снимок.
-3. Для ожидания Codex вызывает `WorkflowWait` с последним полученным
+2. Для ожидания Codex вызывает `WorkflowWait` с последним полученным
    `revision`.
-4. `WorkflowWait` остаётся pending, пока revision не увеличится или workflow не
+3. `WorkflowWait` остаётся pending, пока revision не увеличится или workflow не
    перейдёт в `completed`, `failed` либо `killed`.
-5. Ответ содержит текущий снимок и только события новее переданного revision.
-6. Codex сообщает пользователю реальные изменения phase/role/leaf и снова
+4. Ответ содержит текущий снимок и только события новее переданного revision.
+5. Codex сообщает пользователю реальные изменения phase/role/leaf и снова
    вызывает `WorkflowWait` с новой revision.
-7. `WorkflowStop` переводит run в `killed` и немедленно будит ожидающий
+6. `WorkflowStop` переводит run в `killed` и немедленно будит ожидающий
    `WorkflowWait`.
 
 Heartbeat отсутствует полностью. У workflow нет общего execution deadline.
 
 ## MCP-контракт
-
-### `WorkflowStatus`
-
-Мгновенный read:
-
-```json
-{
-  "runId": "wf_...",
-  "afterRevision": 4
-}
-```
-
-`afterRevision` необязателен и по умолчанию равен `0`. Он только фильтрует
-возвращаемые события. Поле `waitMs` больше не поддерживается.
 
 ### `WorkflowWait`
 
@@ -65,7 +50,7 @@ Tool возвращается сразу, если:
 
 ### Ответ
 
-Оба инструмента возвращают одинаковый снимок:
+`WorkflowWait` возвращает снимок:
 
 ```json
 {
@@ -88,8 +73,8 @@ Tool возвращается сразу, если:
 Поле `heartbeat` удаляется. Terminal snapshot дополнительно содержит `result`,
 если native workflow его вернул.
 
-`WorkflowStart`, `WorkflowStop` и совместимый синхронный `Workflow` сохраняют
-свои контракты.
+`WorkflowStatus` удаляется из публичного API. `WorkflowStart`, `WorkflowStop`
+и совместимый синхронный `Workflow` сохраняют свои контракты.
 
 ## Реализация ожидания
 
@@ -111,7 +96,7 @@ event-loop turn, поэтому событие между ними не теря
 waiter-ов на один run разрешены.
 
 MCP-сервер уже обрабатывает входящие JSON-RPC requests конкурентно, поэтому
-pending `WorkflowWait` не мешает `WorkflowStatus` или `WorkflowStop`.
+pending `WorkflowWait` не мешает `WorkflowStop`.
 
 ## Ограничение Codex host
 
@@ -121,7 +106,8 @@ Codex требует конечный `tool_timeout_sec`; отключить е�
 Bundled `.mcp.json` задаёт практически недостижимый для обычного workflow
 предел в один год. Сам `WorkflowWait` server-side timeout не имеет. Если
 Codex host всё же оборвёт вызов, run продолжит работу, а Codex сможет получить
-снимок по сохранённому `runId` и снова вызвать `WorkflowWait`.
+следующее обновление, снова вызвав `WorkflowWait` с сохранёнными `runId` и
+последним revision.
 
 ## Ошибки
 
@@ -136,11 +122,11 @@ Codex host всё же оборвёт вызов, run продолжит раб�
 Boundary tests должны подтвердить:
 
 - публикацию новой схемы и отсутствие `waitMs`/`heartbeat`;
-- мгновенный `WorkflowStatus`;
+- отсутствие `WorkflowStatus` в списке tools;
 - pending `WorkflowWait` при неизменной revision;
 - немедленный ответ при уже появившейся revision или terminal run;
 - пробуждение от progress event, native terminal state и `WorkflowStop`;
-- возможность вызвать `WorkflowStatus` и `WorkflowStop`, пока Wait pending;
+- возможность вызвать `WorkflowStop`, пока Wait pending;
 - сохранение legacy `Workflow`;
 - работу live canary через revisioned `WorkflowWait`.
 
