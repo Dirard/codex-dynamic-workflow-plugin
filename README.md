@@ -19,6 +19,8 @@ phase/role/leaf progress и не ограничивает общую длите�
 ```dotenv
 ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
 ANTHROPIC_AUTH_TOKEN=ваш_Z.AI_API_key
+# WORKFLOW_MIN_QUOTA_REMAINING_PERCENT=50
+# WORKFLOW_QUOTA_URL=https://api.z.ai/api/monitor/usage/quota/limit
 ```
 
 Ограничьте доступ:
@@ -30,6 +32,15 @@ chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env"
 Вместо файла можно передать те же переменные окружению Codex.
 `ANTHROPIC_API_KEY` поддерживается как альтернатива
 `ANTHROPIC_AUTH_TOKEN`. Значения из окружения имеют приоритет.
+
+Перед `WorkflowStart` и legacy `Workflow` адаптер проверяет Z.AI квоту
+5-часового модельного окна и блокирует запуск, когда remaining percent меньше
+`WORKFLOW_MIN_QUOTA_REMAINING_PERCENT`. По умолчанию порог `50`; допустимы
+конечные значения `0..100`, включая дробные. Значение `0` полностью отключает
+preflight-запрос. Публичный tool `WorkflowQuota` без аргументов всегда делает
+запрос и возвращает только `level`, `usedPercent`, `remainingPercent` и
+`resetAt` (epoch milliseconds). Authorization содержит значение Z.AI token
+без префикса `Bearer`.
 
 ## Использование
 

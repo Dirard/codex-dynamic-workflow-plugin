@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.3.1";
+const SERVER_VERSION = "0.4.0";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -17,10 +17,13 @@ const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const PROGRESS_PATTERN =
   /<codex-workflow-progress>(.{1,1024}?)<\/codex-workflow-progress>/;
 const AGENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const DEFAULT_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
 const PROVIDER_KEYS = new Set([
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_API_KEY",
+  "WORKFLOW_MIN_QUOTA_REMAINING_PERCENT",
+  "WORKFLOW_QUOTA_URL",
 ]);
 const children = new Set();
 const runs = new Map();
@@ -52,6 +55,17 @@ const workflowStartTool = {
   description:
     "Start an exact JavaScript Claude Code Dynamic Workflow in a workspace.",
   inputSchema: workflowInputSchema,
+};
+
+const workflowQuotaTool = {
+  name: "WorkflowQuota",
+  description:
+    "Return the current Z.AI GLM Coding Plan five-hour model quota. No arguments.",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  },
 };
 
 const workflowWaitTool = {
@@ -91,6 +105,7 @@ const workflowTool = {
 
 const tools = [
   workflowStartTool,
+  workflowQuotaTool,
   workflowWaitTool,
   workflowStopTool,
   workflowTool,
@@ -141,8 +156,6 @@ process.once("SIGTERM", () => {
 });
 
 async function loadProviderEnv() {
-  if (providerConfigError() === null) return;
-
   const configRoot =
     process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   let contents;
@@ -205,6 +218,108 @@ function providerConfigError() {
   return null;
 }
 
+function minimumQuotaRemainingPercent() {
+  const rawValue = process.env.WORKFLOW_MIN_QUOTA_REMAINING_PERCENT?.trim();
+  if (!rawValue) return 50;
+
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    throw new Error(
+      "WORKFLOW_MIN_QUOTA_REMAINING_PERCENT must be a finite number from 0 through 100",
+    );
+  }
+  return value;
+}
+
+function quotaUrl() {
+  const url = process.env.WORKFLOW_QUOTA_URL?.trim() || DEFAULT_QUOTA_URL;
+  try {
+    const protocol = new URL(url).protocol;
+    if (protocol !== "http:" && protocol !== "https:") throw new Error();
+  } catch {
+    throw new Error("WORKFLOW_QUOTA_URL must be an absolute HTTP(S) URL");
+  }
+  return url;
+}
+
+function parseQuotaResponse(payload) {
+  if (payload?.code !== 200 || payload.success !== true) {
+    throw new Error("Z.AI quota request was rejected");
+  }
+
+  const level = payload.data?.level;
+  if (typeof level !== "string" || !level.trim()) {
+    throw new Error("Z.AI quota response has no subscription level");
+  }
+
+  const limits = payload.data?.limits;
+  if (!Array.isArray(limits)) {
+    throw new Error("Z.AI quota response has no five-hour model quota");
+  }
+
+  const fiveHourWindows = limits.filter(
+    (limit) =>
+      limit?.type === "TOKENS_LIMIT" &&
+      Number.isFinite(limit.nextResetTime) &&
+      limit.nextResetTime > 0,
+  );
+  if (!fiveHourWindows.length) {
+    throw new Error("Z.AI quota response has no five-hour model quota");
+  }
+
+  const quota = fiveHourWindows.reduce((nearest, current) =>
+    current.nextResetTime < nearest.nextResetTime ? current : nearest,
+  );
+  const usedPercent = quota.percentage;
+  if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) {
+    throw new Error("Z.AI quota response has an invalid model usage percent");
+  }
+
+  return {
+    level,
+    usedPercent,
+    remainingPercent: Number((100 - usedPercent).toFixed(6)),
+    resetAt: quota.nextResetTime,
+  };
+}
+
+async function fetchWorkflowQuota() {
+  const token =
+    process.env.ANTHROPIC_AUTH_TOKEN?.trim() ||
+    process.env.ANTHROPIC_API_KEY?.trim();
+
+  let response;
+  try {
+    response = await fetch(quotaUrl(), {
+      headers: { Authorization: token, Accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    throw new Error("Unable to query Z.AI quota");
+  }
+  if (!response.ok) throw new Error("Unable to query Z.AI quota");
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("Z.AI quota response is not JSON");
+  }
+  return parseQuotaResponse(payload);
+}
+
+async function ensureQuotaAvailable() {
+  const minimum = minimumQuotaRemainingPercent();
+  if (minimum === 0) return;
+
+  const quota = await fetchWorkflowQuota();
+  if (quota.remainingPercent < minimum) {
+    throw new Error(
+      `Z.AI quota remaining is ${quota.remainingPercent}%; minimum is ${minimum}%`,
+    );
+  }
+}
+
 async function handleMessage(message) {
   const hasId = Object.hasOwn(message ?? {}, "id");
   if (
@@ -254,6 +369,8 @@ async function callTool(params) {
         return await callWorkflow(params.arguments, false);
       case "WorkflowStart":
         return await callWorkflow(params.arguments, true);
+      case "WorkflowQuota":
+        return await callWorkflowQuota(params.arguments);
       case "WorkflowWait":
         return await callWorkflowWait(params.arguments);
       case "WorkflowStop":
@@ -283,6 +400,20 @@ async function callWorkflow(args, asynchronous) {
     revision: 0,
     elapsedMs: 0,
   });
+}
+
+async function callWorkflowQuota(args = {}) {
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    if (Object.keys(args).length) {
+      return toolError("WorkflowQuota received an unsupported argument");
+    }
+  } else {
+    return toolError("WorkflowQuota arguments must be an object");
+  }
+
+  const configError = providerConfigError();
+  if (configError) return toolError(configError);
+  return toolSuccess(await fetchWorkflowQuota());
 }
 
 async function callWorkflowWait(args) {
@@ -367,6 +498,7 @@ function validateStopArguments(args) {
 async function startWorkflow(nativeArguments, cwd) {
   const configError = providerConfigError();
   if (configError) throw new Error(configError);
+  await ensureQuotaAvailable();
 
   const native = startNativeClient(cwd);
   try {

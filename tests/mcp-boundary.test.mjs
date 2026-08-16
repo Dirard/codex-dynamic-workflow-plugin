@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { createServer } from "node:http";
 import {
   appendFile,
   chmod,
@@ -242,6 +244,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
+  assert.equal(initialized.serverInfo.version, "0.4.0");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -680,6 +683,8 @@ test("plugin starts its bundled native-workflow adapter", () => {
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
+    "WORKFLOW_MIN_QUOTA_REMAINING_PERCENT",
+    "WORKFLOW_QUOTA_URL",
     "XDG_CONFIG_HOME",
   ]);
   assert.equal(server.tool_timeout_sec, 31_536_000);
@@ -696,7 +701,13 @@ test("native-workflow allows implicit invocation", async () => {
 function startClient(env = {}) {
   const child = spawn(server.command, server.args, {
     cwd: repositoryRoot,
-    env: { ...process.env, ...server.env, ...env },
+    env: {
+      ...process.env,
+      ...server.env,
+      WORKFLOW_MIN_QUOTA_REMAINING_PERCENT:
+        env.WORKFLOW_MIN_QUOTA_REMAINING_PERCENT ?? "0",
+      ...env,
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const pending = new Map();
@@ -766,6 +777,63 @@ function startClient(env = {}) {
   };
 }
 
+async function startQuotaServer(t, limits, status = 200) {
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push({
+      method: request.method,
+      url: request.url,
+      authorization: request.headers.authorization,
+    });
+    response.setHeader("content-type", "application/json");
+    response.statusCode = status;
+    response.end(
+      JSON.stringify({
+        code: status,
+        msg: "",
+        data: { level: "max", limits },
+        success: status === 200,
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return {
+    url: `http://127.0.0.1:${server.address().port}/quota`,
+    requests,
+  };
+}
+
+async function startRawQuotaServer(t, body, contentType = "application/json") {
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", contentType);
+    response.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return `http://127.0.0.1:${server.address().port}/quota`;
+}
+
+async function startQuotaClient(t, url) {
+  const client = startClient({
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    WORKFLOW_QUOTA_URL: url,
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+  return client;
+}
+
+async function assertQuotaFailure(client, message) {
+  const result = await client.request("tools/call", {
+    name: "WorkflowQuota",
+    arguments: {},
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, message);
+}
+
 test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   const client = startClient();
   t.after(() => client.stop());
@@ -775,6 +843,7 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
   assert.deepEqual(Object.keys(byName).sort(), [
     "Workflow",
+    "WorkflowQuota",
     "WorkflowStart",
     "WorkflowStop",
     "WorkflowWait",
@@ -790,6 +859,252 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
     "afterRevision",
   ]);
   assert.deepEqual(byName.WorkflowStop.inputSchema.required, ["runId"]);
+  assert.deepEqual(byName.WorkflowQuota.inputSchema, {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  });
+});
+
+test("WorkflowQuota uses the raw token and returns only the nearest five-hour model quota", async (t) => {
+  const nearReset = Date.now() + 3_600_000;
+  const quota = await startQuotaServer(t, [
+    {
+      type: "TOKENS_LIMIT",
+      percentage: 10,
+      nextResetTime: Date.now() + 7 * 24 * 3_600_000,
+    },
+    {
+      type: "TIME_LIMIT",
+      percentage: 99,
+      nextResetTime: Date.now() + 600_000,
+    },
+    {
+      type: "TOKENS_LIMIT",
+      percentage: 25.5,
+      nextResetTime: nearReset,
+    },
+  ]);
+  const client = startClient({
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    WORKFLOW_MIN_QUOTA_REMAINING_PERCENT: "101",
+    WORKFLOW_QUOTA_URL: quota.url,
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+
+  const invalidArguments = await client.request("tools/call", {
+    name: "WorkflowQuota",
+    arguments: { unexpected: true },
+  });
+  assert.equal(invalidArguments.isError, true);
+  assert.equal(invalidArguments.content[0].text, "WorkflowQuota received an unsupported argument");
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowQuota",
+  });
+  assertToolSuccess(result, "WorkflowQuota");
+  assert.deepEqual(parseToolPayload(result), {
+    level: "max",
+    usedPercent: 25.5,
+    remainingPercent: 74.5,
+    resetAt: nearReset,
+  });
+  assert.deepEqual(quota.requests.map((request) => request.method), ["GET"]);
+  assert.equal(quota.requests[0].url, "/quota");
+  assert.equal(quota.requests[0].authorization, "quota-test-token");
+});
+
+test("a decimal custom quota threshold blocks WorkflowStart before Claude spawns", async (t) => {
+  const marker = join(tmpdir(), `quota-blocked-${process.pid}`);
+  const quota = await startQuotaServer(t, [
+    {
+      type: "TOKENS_LIMIT",
+      percentage: 87.6,
+      nextResetTime: Date.now() + 3_600_000,
+    },
+  ]);
+  const { client } = await startFakeModeClient(t, "complete", {
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    FAKE_WORKFLOW_MARKER: marker,
+    WORKFLOW_MIN_QUOTA_REMAINING_PERCENT: "12.5",
+    WORKFLOW_QUOTA_URL: quota.url,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script: 'export const meta = { name: "quota-blocked" };',
+    },
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Z\.AI quota remaining is 12\.4%; minimum is 12\.5%/);
+
+  const legacyResult = await client.request("tools/call", {
+    name: "Workflow",
+    arguments: {
+      cwd: repositoryRoot,
+      script: 'export const meta = { name: "quota-blocked-legacy" };',
+    },
+  });
+  assert.equal(legacyResult.isError, true);
+  assert.match(legacyResult.content[0].text, /Z\.AI quota remaining is 12\.4%; minimum is 12\.5%/);
+
+  assert.equal(quota.requests.length, 2);
+  assert.equal(existsSync(marker), false);
+});
+
+test("the default threshold allows exactly fifty percent remaining", async (t) => {
+  const marker = join(tmpdir(), `quota-exact-${process.pid}`);
+  const configHome = await mkdtemp(join(tmpdir(), "quota-default-config-"));
+  t.after(() => rm(configHome, { recursive: true, force: true }));
+  await rm(marker, { force: true });
+  const quota = await startQuotaServer(t, [
+    {
+      type: "TOKENS_LIMIT",
+      percentage: 50,
+      nextResetTime: Date.now() + 3_600_000,
+    },
+  ]);
+  const { client } = await startFakeModeClient(t, "complete", {
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    FAKE_WORKFLOW_MARKER: marker,
+    WORKFLOW_MIN_QUOTA_REMAINING_PERCENT: "",
+    WORKFLOW_QUOTA_URL: quota.url,
+    XDG_CONFIG_HOME: configHome,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script: 'export const meta = { name: "quota-exact" };',
+    },
+  });
+  assertToolSuccess(result, "WorkflowStart");
+  assert.equal(quota.requests.length, 1);
+  assert.equal(existsSync(marker), true);
+});
+
+test("a zero threshold disables the quota request but still starts Claude", async (t) => {
+  const quota = await startQuotaServer(t, [
+    {
+      type: "TOKENS_LIMIT",
+      percentage: 0,
+      nextResetTime: Date.now() + 3_600_000,
+    },
+  ]);
+  const { client } = await startFakeModeClient(t, "complete", {
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    WORKFLOW_MIN_QUOTA_REMAINING_PERCENT: "0",
+    WORKFLOW_QUOTA_URL: quota.url,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script: 'export const meta = { name: "quota-disabled" };',
+    },
+  });
+  assertToolSuccess(result, "WorkflowStart");
+  assert.equal(quota.requests.length, 0);
+
+  const quotaResult = await client.request("tools/call", {
+    name: "WorkflowQuota",
+    arguments: {},
+  });
+  assertToolSuccess(quotaResult, "WorkflowQuota");
+  assert.equal(quota.requests.length, 1);
+});
+
+test("an invalid threshold is a fail-closed configuration error", async (t) => {
+  const marker = join(tmpdir(), `quota-invalid-${process.pid}`);
+  const quota = await startQuotaServer(t, []);
+  const { client } = await startFakeModeClient(t, "complete", {
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    FAKE_WORKFLOW_MARKER: marker,
+    WORKFLOW_MIN_QUOTA_REMAINING_PERCENT: "101",
+    WORKFLOW_QUOTA_URL: quota.url,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script: 'export const meta = { name: "quota-invalid" };',
+    },
+  });
+  assert.equal(result.isError, true);
+  assert.match(
+    result.content[0].text,
+    /WORKFLOW_MIN_QUOTA_REMAINING_PERCENT must be a finite number from 0 through 100/,
+  );
+  assert.equal(quota.requests.length, 0);
+  assert.equal(existsSync(marker), false);
+});
+
+test("WorkflowQuota fails closed without a five-hour model quota", async (t) => {
+  const quota = await startQuotaServer(t, [
+    {
+      type: "TIME_LIMIT",
+      percentage: 10,
+      nextResetTime: Date.now() + 3_600_000,
+    },
+  ]);
+  const client = startClient({
+    ANTHROPIC_BASE_URL: "https://example.invalid",
+    ANTHROPIC_AUTH_TOKEN: "quota-test-token",
+    WORKFLOW_QUOTA_URL: quota.url,
+  });
+  t.after(() => client.stop());
+  await initialize(client);
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowQuota",
+    arguments: {},
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, "Z.AI quota response has no five-hour model quota");
+});
+
+test("WorkflowQuota fails closed when quota authentication fails", async (t) => {
+  const quota = await startQuotaServer(t, [], 401);
+  const client = await startQuotaClient(t, quota.url);
+  await assertQuotaFailure(client, "Unable to query Z.AI quota");
+  assert.equal(quota.requests.length, 1);
+});
+
+test("WorkflowQuota rejects an unsuccessful HTTP 200 response", async (t) => {
+  const client = await startQuotaClient(
+    t,
+    await startRawQuotaServer(
+      t,
+      JSON.stringify({ code: 429, msg: "rejected", data: null, success: false }),
+    ),
+  );
+  await assertQuotaFailure(client, "Z.AI quota request was rejected");
+});
+
+test("WorkflowQuota fails closed when quota response is not JSON", async (t) => {
+  const client = await startQuotaClient(
+    t,
+    await startRawQuotaServer(t, "not-json"),
+  );
+  await assertQuotaFailure(client, "Z.AI quota response is not JSON");
+});
+
+test("WorkflowQuota fails closed when quota usage percent is invalid", async (t) => {
+  const quota = await startQuotaServer(t, [
+      { type: "TOKENS_LIMIT", nextResetTime: Date.now() + 3_600_000 },
+    ]);
+  const client = await startQuotaClient(t, quota.url);
+  await assertQuotaFailure(
+    client,
+    "Z.AI quota response has an invalid model usage percent",
+  );
 });
 
 test("WorkflowStart preserves Claude Code's rejection reason", async (t) => {

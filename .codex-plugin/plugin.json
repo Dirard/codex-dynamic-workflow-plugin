@@ -1,6 +1,6 @@
 {
   "name": "codex-dynamic-workflow-plugin",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Codex планирует native Claude Code workflows, а GLM-5.2 выполняет leaf-задачи.",
   "author": {
     "name": "Dirard",
