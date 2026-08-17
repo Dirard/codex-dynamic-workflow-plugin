@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { open, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.3";
+const SERVER_VERSION = "0.5.4";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -610,6 +611,7 @@ function startNativeSessionClient(cwd) {
   let child;
   let reader;
   let launchPromise;
+  let transportStateRoot;
   let closed = false;
 
   const request = (method, params) => {
@@ -622,6 +624,15 @@ function startNativeSessionClient(cwd) {
     }
 
     const expectedInput = params.arguments;
+    transportStateRoot = mkdtempSync(
+      join(tmpdir(), "codex-workflow-transport-"),
+    );
+    const transportStatePath = join(transportStateRoot, "state.json");
+    writeFileSync(
+      transportStatePath,
+      JSON.stringify({ expectedInput }),
+      { encoding: "utf8", mode: 0o600 },
+    );
     child = spawn(
       "claude",
       [
@@ -640,7 +651,7 @@ function startNativeSessionClient(cwd) {
                   {
                     type: "command",
                     command: process.execPath,
-                    args: [TRANSPORT_GUARD_PATH],
+                    args: [TRANSPORT_GUARD_PATH, transportStatePath],
                   },
                 ],
               },
@@ -662,7 +673,8 @@ function startNativeSessionClient(cwd) {
     reader = createInterface({ input: child.stdout });
 
     launchPromise = new Promise((resolveLaunch, rejectLaunch) => {
-      let toolUseId;
+      const exactToolUses = new Set();
+      const rejectedToolUses = new Set();
       let settled = false;
       const timer = setTimeout(
         () => fail(new Error("Claude Code did not launch the workflow")),
@@ -705,24 +717,39 @@ function startNativeSessionClient(cwd) {
         if (!Array.isArray(blocks)) return;
         for (const block of blocks) {
           if (block?.type === "tool_use") {
-            if (
-              block.name !== "Workflow" ||
-              toolUseId ||
-              !isDeepStrictEqual(block.input, expectedInput)
-            ) {
-              fail(new Error("Claude Code changed the workflow request"));
+            if (typeof block.id !== "string" || !block.id) {
+              fail(new Error("Claude Code returned an invalid tool request"));
               return;
             }
-            toolUseId = block.id;
+            if (
+              block.name !== "Workflow" ||
+              !isDeepStrictEqual(block.input, expectedInput)
+            ) {
+              rejectedToolUses.add(block.id);
+            } else {
+              exactToolUses.add(block.id);
+            }
           }
           if (
             block?.type === "tool_result" &&
-            toolUseId &&
-            block.tool_use_id === toolUseId
+            rejectedToolUses.delete(block.tool_use_id)
+          ) {
+            if (block.is_error !== true) {
+              fail(
+                new Error("Claude Code executed an unapproved workflow request"),
+              );
+              return;
+            }
+            continue;
+          }
+          if (
+            block?.type === "tool_result" &&
+            exactToolUses.delete(block.tool_use_id)
           ) {
             const text =
               typeof block.content === "string" ? block.content.trim() : "";
-            if (block.is_error || !text) {
+            if (block.is_error === true) continue;
+            if (!text) {
               fail(
                 new Error(
                   text.slice(0, 2048) || "Claude Code rejected the workflow",
@@ -778,6 +805,14 @@ function startNativeSessionClient(cwd) {
       child.kill("SIGTERM");
     }
     children.delete(child);
+    if (transportStateRoot) {
+      try {
+        rmSync(transportStateRoot, { recursive: true, force: true });
+      } catch {
+        process.stderr.write("Unable to remove transport guard state\n");
+      }
+      transportStateRoot = undefined;
+    }
   };
 
   return {

@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import test from "node:test";
@@ -276,7 +276,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.3");
+  assert.equal(initialized.serverInfo.version, "0.5.4");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -436,7 +436,8 @@ if (process.argv.includes("-p")) {
   process.stdin.on("end", () => {
     const match = prompt.match(/<workflow-input>([\\s\\S]+)<\\/workflow-input>/);
     if (!match) process.exit(2);
-    receivedWorkflowInput = JSON.parse(match[1]);
+    const plannedWorkflowInput = JSON.parse(match[1]);
+    receivedWorkflowInput = plannedWorkflowInput;
     if (process.env.FAKE_WORKFLOW_MUTATE_INPUT === "1") {
       receivedWorkflowInput = {
         ...receivedWorkflowInput,
@@ -450,16 +451,75 @@ if (process.argv.includes("-p")) {
       scheduleState("completed");
     }
     const toolUseId = "call_workflow_fixture";
+    if (process.env.FAKE_WORKFLOW_RETRY_EXACT === "1") {
+      const rejectedId = "call_workflow_rejected";
+      process.stdout.write(
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [{
+              type: "tool_use",
+              id: rejectedId,
+              name: "Workflow",
+              input: {
+                ...plannedWorkflowInput,
+                script: plannedWorkflowInput.script + "\\n// changed",
+              },
+            }],
+          },
+        }) + "\\n",
+      );
+      process.stdout.write(
+        JSON.stringify({
+          type: "user",
+          message: {
+            content: [{
+              type: "tool_result",
+              tool_use_id: rejectedId,
+              content: "Denied by transport guard",
+              is_error: true,
+            }],
+          },
+        }) + "\\n",
+      );
+      receivedWorkflowInput = plannedWorkflowInput;
+    }
+    const launchResult = {
+      type: "tool_result",
+      tool_use_id: toolUseId,
+      content:
+        "Workflow launched in background.\\n" +
+        "Script file: " + path.join(stateRoot, "scripts", "workflow.js") + "\\n" +
+        "Run ID: " + runId + "\\n",
+      is_error: false,
+    };
+    const parallelDeniedId = "call_workflow_parallel_denied";
+    const parallelExact = process.env.FAKE_WORKFLOW_PARALLEL_EXACT === "1";
     process.stdout.write(
       JSON.stringify({
         type: "assistant",
         message: {
-          content: [{
-            type: "tool_use",
-            id: toolUseId,
-            name: "Workflow",
-            input: receivedWorkflowInput,
-          }],
+          content: parallelExact
+            ? [
+                {
+                  type: "tool_use",
+                  id: parallelDeniedId,
+                  name: "Workflow",
+                  input: plannedWorkflowInput,
+                },
+                {
+                  type: "tool_use",
+                  id: toolUseId,
+                  name: "Workflow",
+                  input: plannedWorkflowInput,
+                },
+              ]
+            : [{
+                type: "tool_use",
+                id: toolUseId,
+                name: "Workflow",
+                input: receivedWorkflowInput,
+              }],
         },
       }) + "\\n",
     );
@@ -467,15 +527,17 @@ if (process.argv.includes("-p")) {
       JSON.stringify({
         type: "user",
         message: {
-          content: [{
-            type: "tool_result",
-            tool_use_id: toolUseId,
-            content:
-              "Workflow launched in background.\\n" +
-              "Script file: " + path.join(stateRoot, "scripts", "workflow.js") + "\\n" +
-              "Run ID: " + runId + "\\n",
-            is_error: false,
-          }],
+          content: parallelExact
+            ? [
+                {
+                  type: "tool_result",
+                  tool_use_id: parallelDeniedId,
+                  content: "Denied by transport guard",
+                  is_error: true,
+                },
+                launchResult,
+              ]
+            : [launchResult],
         },
       }) + "\\n",
     );
@@ -1391,22 +1453,14 @@ test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t
     "Workflow",
   ]);
   assert.equal(completed.result.argv[5], "--settings");
-  assert.deepEqual(JSON.parse(completed.result.argv[6]), {
-    hooks: {
-      PreToolUse: [
-        {
-          matcher: ".*",
-          hooks: [
-            {
-              type: "command",
-              command: process.execPath,
-              args: [transportGuardPath],
-            },
-          ],
-        },
-      ],
-    },
-  });
+  const settings = JSON.parse(completed.result.argv[6]);
+  const commandHook = settings.hooks.PreToolUse[0].hooks[0];
+  assert.equal(settings.hooks.PreToolUse[0].matcher, ".*");
+  assert.equal(commandHook.type, "command");
+  assert.equal(commandHook.command, process.execPath);
+  assert.equal(commandHook.args[0], transportGuardPath);
+  assert.equal(isAbsolute(commandHook.args[1]), true);
+  assert.equal(basename(commandHook.args[1]), "state.json");
   assert.deepEqual(completed.result.argv.slice(7), [
     "--output-format",
     "stream-json",
@@ -1418,6 +1472,7 @@ test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t
     script:
       'export const meta = { name: "editable", description: "Editable" };\nreturn { ok: true };',
   });
+  assert.equal(existsSync(commandHook.args[1]), false);
 });
 
 test("WorkflowStart rejects changed editable workflow input", async (t) => {
@@ -1435,7 +1490,54 @@ test("WorkflowStart rejects changed editable workflow input", async (t) => {
   });
 
   assert.equal(result.isError, true);
-  assert.equal(result.content[0].text, "Claude Code changed the workflow request");
+  assert.equal(
+    result.content[0].text,
+    "Claude Code executed an unapproved workflow request",
+  );
+});
+
+test("WorkflowStart accepts an exact retry after the guard denies a changed attempt", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_RETRY_EXACT: "1",
+  });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "retry", description: "Retry" };\nreturn { ok: true };',
+      allowEdits: true,
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(completed.status, "completed");
+});
+
+test("WorkflowStart tracks the hook-approved exact call in a parallel batch", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_PARALLEL_EXACT: "1",
+  });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "parallel", description: "Parallel" };\nreturn { ok: true };',
+      allowEdits: true,
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(completed.status, "completed");
 });
 
 test("editable workflow consumes terminal state when print session exits", async (t) => {

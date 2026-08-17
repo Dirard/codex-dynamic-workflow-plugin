@@ -91,7 +91,8 @@ Canary запускает два параллельных GLM reviewer leaf и �
 В Claude Code 2.1.233 `mcp serve` фиксирует default permission context, поэтому
 `allowEdits: true` использует полноценную print/SDK session с `acceptEdits`, а
 read-only path остаётся на `mcp serve`. Transport session ограничена hook-ом:
-она может вызвать только `Workflow`, тогда как edit-права применяются к leaf.
+она может вызвать ровно один `Workflow` с exact Codex-planned input, тогда как
+edit-права применяются к leaf.
 Prompt-based read-only означает
 намерение, а не sandbox или permissions boundary. Codex approval относится
 только к внешнему MCP-вызову; sandbox profile Codex автоматически не
