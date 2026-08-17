@@ -5,10 +5,11 @@ import { open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.2";
+const SERVER_VERSION = "0.5.3";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -27,6 +28,9 @@ const PROVIDER_KEYS = new Set([
   "WORKFLOW_MIN_QUOTA_REMAINING_PERCENT",
   "WORKFLOW_QUOTA_URL",
 ]);
+const TRANSPORT_GUARD_PATH = fileURLToPath(
+  new URL("./transport-tool-guard.mjs", import.meta.url),
+);
 const children = new Set();
 const runs = new Map();
 
@@ -626,6 +630,23 @@ function startNativeSessionClient(cwd) {
         "acceptEdits",
         "--allowedTools",
         "Workflow",
+        "--settings",
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: ".*",
+                hooks: [
+                  {
+                    type: "command",
+                    command: process.execPath,
+                    args: [TRANSPORT_GUARD_PATH],
+                  },
+                ],
+              },
+            ],
+          },
+        }),
         "--output-format",
         "stream-json",
         "--verbose",

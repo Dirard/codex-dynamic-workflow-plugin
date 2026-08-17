@@ -21,6 +21,9 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url)).replace(
   /[/\\]$/,
   "",
 );
+const transportGuardPath = fileURLToPath(
+  new URL("../scripts/transport-tool-guard.mjs", import.meta.url),
+);
 const config = JSON.parse(
   await readFile(new URL("../.mcp.json", import.meta.url), "utf8"),
 );
@@ -273,7 +276,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.2");
+  assert.equal(initialized.serverInfo.version, "0.5.3");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -1380,12 +1383,31 @@ test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t
     client,
     parseToolPayload(started).runId,
   );
-  assert.deepEqual(completed.result.argv, [
+  assert.deepEqual(completed.result.argv.slice(0, 5), [
     "-p",
     "--permission-mode",
     "acceptEdits",
     "--allowedTools",
     "Workflow",
+  ]);
+  assert.equal(completed.result.argv[5], "--settings");
+  assert.deepEqual(JSON.parse(completed.result.argv[6]), {
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: ".*",
+          hooks: [
+            {
+              type: "command",
+              command: process.execPath,
+              args: [transportGuardPath],
+            },
+          ],
+        },
+      ],
+    },
+  });
+  assert.deepEqual(completed.result.argv.slice(7), [
     "--output-format",
     "stream-json",
     "--verbose",
