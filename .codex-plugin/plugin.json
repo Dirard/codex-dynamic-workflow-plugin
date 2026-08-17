@@ -1,7 +1,7 @@
 {
   "name": "codex-dynamic-workflow-plugin",
-  "version": "0.4.0",
-  "description": "Codex планирует native Claude Code workflows, а GLM-5.2 выполняет leaf-задачи.",
+  "version": "0.5.0",
+  "description": "Codex планирует native Claude Code workflows, а настраиваемая GLM выполняет leaf-задачи.",
   "author": {
     "name": "Dirard",
     "email": "ardaginaa@gmail.com",
@@ -12,13 +12,13 @@
     "codex",
     "claude-code",
     "dynamic-workflows",
-    "glm-5.2"
+    "glm-5.3"
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Codex Dynamic Workflow",
-    "shortDescription": "Codex планирует, GLM-5.2 исполняет",
+    "shortDescription": "Codex планирует, GLM исполняет",
     "longDescription": "Запускает точные Claude Code Dynamic Workflow scripts, полностью спланированные Codex, и показывает observable phase, role и leaf status без общего execution deadline.",
     "developerName": "Dirard",
     "category": "Developer Tools",

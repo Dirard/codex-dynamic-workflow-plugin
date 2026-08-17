@@ -1,12 +1,13 @@
 ---
 name: native-workflow
-description: Use when пользователь явно просит запустить Claude Code Dynamic Workflow, multi-agent orchestration или этот skill с GLM-5.2 leaf agents.
+description: Use when пользователь явно просит запустить Claude Code Dynamic Workflow, multi-agent orchestration или этот skill с внешними GLM leaf agents.
 ---
 
 # Native Workflow
 
-Codex определяет DAG, prompts, schemas, условия и следующие действия. GLM-5.2
-исполняет только leaf-вызовы `agent()`; не отдавать ему планирование workflow.
+Codex определяет DAG, prompts, schemas, условия и следующие действия.
+Настроенная через `WORKFLOW_MODEL` модель (по умолчанию `glm-5.3`) исполняет
+только leaf-вызовы `agent()`; не отдавать ей планирование workflow.
 
 ## Подготовка
 
@@ -48,12 +49,17 @@ real JSON в `args`. Не использовать imports, Node API, clocks/ran
 `script` — точный исполняемый JavaScript-сценарий, который уже построил Codex,
 а не текст задания на естественном языке.
 
-1. Вызвать `claude-workflow:WorkflowStart({ cwd, script, args? })` с абсолютным
-   `cwd` и этим точным inline script.
+1. Вызвать
+   `claude-workflow:WorkflowStart({ cwd, script, args?, allowEdits? })` с
+   абсолютным `cwd` рабочего workspace внешнего агента и этим точным inline
+   script. Для mutating run передавать `allowEdits: true`; это включает
+   Claude `acceptEdits` для данного `cwd`, но не bypass остальных permissions.
 2. Сразу сообщить пользователю `runId` и первую запланированную phase.
-3. Вызвать
+3. Напрямую вызвать MCP tool
    `claude-workflow:WorkflowWait({ runId, afterRevision })`, передав последний
-   полученный `revision`.
+   полученный `revision`. Не помещать Wait во внешний background/async shell,
+   execution wrapper или отдельную фоновую сессию: Wait сам блокируется до
+   новой revision или terminal state.
 4. После ответа сообщить только новые phase/role/leaf events и повторить
    `WorkflowWait` с новой revision.
 5. Продолжать без общего deadline до `completed`, `failed` или `killed`.

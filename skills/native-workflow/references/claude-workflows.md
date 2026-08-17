@@ -1,8 +1,8 @@
 # Claude Code Dynamic Workflows для Codex
 
 Адаптация Workflow-раздела из Claude Code `2.1.204`. Codex использует этот
-контракт для проектирования workflow; GLM-5.2 исполняет только leaf-вызовы
-`agent()`.
+контракт для проектирования workflow; настроенная GLM (по умолчанию
+`glm-5.3`) исполняет только leaf-вызовы `agent()`.
 
 ## Содержание
 
@@ -57,7 +57,7 @@ native runtime, но для этого плагина всегда задава�
 `meta.phases`, `phase()` и progress metadata должны совпадать посимвольно.
 
 Native runtime допускает model override в phase metadata, но плагин его не
-использует: leaf наследует `glm-5.2` из MCP session.
+использует: leaf наследует модель `WORKFLOW_MODEL` из MCP session.
 
 ## 3. Runtime hooks
 
@@ -81,8 +81,8 @@ agent(prompt, {
   которые иначе конфликтуют. Для read-only prompt это не требуется.
 
 Native поддерживает `model`, `effort` и custom `agentType`, но в scripts этого
-плагина их не указывать. Сессия уже фиксирует GLM-5.2; custom agents не
-передаются wrapper-ом `claude mcp serve`.
+плагина их не указывать. Сессия уже фиксирует настроенную GLM; custom agents
+не передаются wrapper-ом `claude mcp serve`.
 
 ### `pipeline()`
 
@@ -249,6 +249,8 @@ reviewer preset.
 `revision`. Wait возвращается только после новой revision или terminal state.
 Сообщать новые phase/role/leaf events. Общего execution deadline у async path
 нет. На отмену пользователя вызывать `WorkflowStop`; он будит pending Wait.
+`WorkflowWait` вызывать напрямую как MCP tool, без background/async shell,
+execution wrapper или отдельной фоновой сессии.
 
 `log()` остаётся полезен внутри native UI, но Codex считает источником live
 progress только `WorkflowWait`.
@@ -256,7 +258,7 @@ progress только `WorkflowWait`.
 ## 10. Resume и различия плагина
 
 Native Claude Workflow умеет resume по `scriptPath` и `resumeFromRunId`, кешируя
-неизменившийся prefix `agent()` calls. Wrapper версии `0.3.1` не публикует эти
+неизменившийся prefix `agent()` calls. Текущий wrapper не публикует эти
 outer inputs: передавать exact inline `script` в новый `WorkflowStart`.
 Не пытаться читать native journal или transcript напрямую — wrapper возвращает
 безопасный normalized status.
@@ -265,7 +267,9 @@ outer inputs: передавать exact inline `script` в новый `Workflow
 
 - Codex задаёт весь DAG и inline script.
 - Не указывать `model`, `effort`, custom `agentType`.
-- GLM-5.2 используется только в `agent()`.
+- Модель `WORKFLOW_MODEL` (default `glm-5.3`) используется только в `agent()`.
+- `allowEdits: true` включает Claude `acceptEdits` для переданного `cwd`;
+  без поля permission mode не меняется.
 - `isolation: "worktree"` — только для параллельных mutating leaf.
 - Outer resume пока недоступен.
 - Progress идёт через tracked `leaf()` и async lifecycle tools.

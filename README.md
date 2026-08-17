@@ -1,8 +1,8 @@
 # Codex Dynamic Workflow Plugin
 
 Codex строит точный JavaScript workflow и остаётся оркестратором. Нативный
-Claude Code Dynamic Workflow исполняет сценарий, а `glm-5.2` работает только
-внутри leaf-вызовов `agent()`. Плагин сразу возвращает `runId`, показывает
+Claude Code Dynamic Workflow исполняет сценарий, а настроенная GLM работает
+только внутри leaf-вызовов `agent()`. Плагин сразу возвращает `runId`, показывает
 phase/role/leaf progress и не ограничивает общую длительность async workflow.
 
 ## Требования
@@ -19,6 +19,7 @@ phase/role/leaf progress и не ограничивает общую длите�
 ```dotenv
 ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
 ANTHROPIC_AUTH_TOKEN=ваш_Z.AI_API_key
+# WORKFLOW_MODEL=glm-5.3
 # WORKFLOW_MIN_QUOTA_REMAINING_PERCENT=50
 # WORKFLOW_QUOTA_URL=https://api.z.ai/api/monitor/usage/quota/limit
 ```
@@ -32,6 +33,8 @@ chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env"
 Вместо файла можно передать те же переменные окружению Codex.
 `ANTHROPIC_API_KEY` поддерживается как альтернатива
 `ANTHROPIC_AUTH_TOKEN`. Значения из окружения имеют приоритет.
+`WORKFLOW_MODEL` задаёт модель основной Claude-сессии и всех leaf agents;
+по умолчанию используется `glm-5.3`.
 
 Перед `WorkflowStart` и legacy `Workflow` адаптер проверяет Z.AI квоту
 5-часового модельного окна и блокирует запуск, когда remaining percent меньше
@@ -52,10 +55,15 @@ $codex-dynamic-workflow-plugin:native-workflow
 ```
 
 Codex сформирует точный исполняемый JavaScript `script` (не текст задания),
-передаст абсолютный путь текущего workspace в `cwd`,
-вызовет `WorkflowStart`, а затем `WorkflowWait` с последним `revision`. Wait
-возвращается только после реального изменения phase/role/leaf или terminal
-state; периодические пустые ответы и polling по таймеру отсутствуют.
+передаст абсолютный путь workspace внешнего агента в `cwd` и вызовет
+`WorkflowStart`. Для mutating run можно передать `allowEdits: true`: дочерний
+Claude стартует в `acceptEdits` для этого `cwd`, без bypass остальных
+permissions.
+
+`WorkflowWait` нужно вызывать напрямую как MCP tool с последним `revision`,
+не через background/async shell или execution wrapper. Wait сам удерживает
+вызов до реального изменения phase/role/leaf или terminal state; периодические
+пустые ответы и polling по таймеру отсутствуют.
 
 У async path нет общего execution deadline. `WorkflowStop` явно отменяет run,
 будит pending Wait и возвращает killed state. Старый синхронный `Workflow`

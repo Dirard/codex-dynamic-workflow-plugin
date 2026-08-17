@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.4.0";
+const SERVER_VERSION = "0.5.0";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -22,6 +22,7 @@ const PROVIDER_KEYS = new Set([
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_API_KEY",
+  "WORKFLOW_MODEL",
   "WORKFLOW_MIN_QUOTA_REMAINING_PERCENT",
   "WORKFLOW_QUOTA_URL",
 ]);
@@ -45,6 +46,11 @@ const workflowInputSchema = {
       maxLength: MAX_SCRIPT_LENGTH,
     },
     args: {},
+    allowEdits: {
+      type: "boolean",
+      description:
+        "Start Claude Code in acceptEdits permission mode for the requested cwd.",
+    },
   },
   required: ["cwd", "script"],
   additionalProperties: false,
@@ -71,7 +77,7 @@ const workflowQuotaTool = {
 const workflowWaitTool = {
   name: "WorkflowWait",
   description:
-    "Wait for a workflow revision or terminal state and return its progress snapshot.",
+    "Call directly to wait for a workflow revision or terminal state. Do not wrap this tool in a background execution shell.",
   inputSchema: {
     type: "object",
     properties: {
@@ -391,9 +397,14 @@ async function callWorkflow(args, asynchronous) {
 
   const nativeArguments = { script: args.script };
   if (Object.hasOwn(args, "args")) nativeArguments.args = args.args;
-  if (!asynchronous) return toolSuccess(await runWorkflow(nativeArguments, args.cwd));
+  const allowEdits = args.allowEdits === true;
+  if (!asynchronous) {
+    return toolSuccess(
+      await runWorkflow(nativeArguments, args.cwd, allowEdits),
+    );
+  }
 
-  const run = await startWorkflow(nativeArguments, args.cwd);
+  const run = await startWorkflow(nativeArguments, args.cwd, allowEdits);
   return toolSuccess({
     runId: run.runId,
     status: "starting",
@@ -445,7 +456,11 @@ function validateArguments(args) {
   }
   if (
     Object.keys(args).some(
-      (key) => key !== "cwd" && key !== "script" && key !== "args",
+      (key) =>
+        key !== "cwd" &&
+        key !== "script" &&
+        key !== "args" &&
+        key !== "allowEdits",
     )
   ) {
     return "Workflow received an unsupported argument";
@@ -458,6 +473,12 @@ function validateArguments(args) {
   }
   if (args.script.length > MAX_SCRIPT_LENGTH) {
     return "Workflow script is too large";
+  }
+  if (
+    Object.hasOwn(args, "allowEdits") &&
+    typeof args.allowEdits !== "boolean"
+  ) {
+    return "Workflow allowEdits must be a boolean";
   }
   return null;
 }
@@ -495,12 +516,12 @@ function validateStopArguments(args) {
   return null;
 }
 
-async function startWorkflow(nativeArguments, cwd) {
+async function startWorkflow(nativeArguments, cwd, allowEdits) {
   const configError = providerConfigError();
   if (configError) throw new Error(configError);
   await ensureQuotaAvailable();
 
-  const native = startNativeClient(cwd);
+  const native = startNativeClient(cwd, allowEdits);
   try {
     await native.request("initialize", {
       protocolVersion: PROTOCOL_VERSION,
@@ -568,14 +589,18 @@ async function startWorkflow(nativeArguments, cwd) {
   }
 }
 
-function startNativeClient(cwd) {
-  const child = spawn("claude", ["mcp", "serve"], {
+function startNativeClient(cwd, allowEdits) {
+  const model = process.env.WORKFLOW_MODEL?.trim() || "glm-5.3";
+  const claudeArgs = allowEdits
+    ? ["--permission-mode", "acceptEdits", "mcp", "serve"]
+    : ["mcp", "serve"];
+  const child = spawn("claude", claudeArgs, {
     cwd,
     env: {
       ...process.env,
       CLAUDE_CODE_WORKFLOWS: "1",
-      ANTHROPIC_MODEL: "glm-5.2",
-      CLAUDE_CODE_SUBAGENT_MODEL: "glm-5.2",
+      ANTHROPIC_MODEL: model,
+      CLAUDE_CODE_SUBAGENT_MODEL: model,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1095,8 +1120,8 @@ function stopWorkflow(run) {
   return snapshotRun(run, 0);
 }
 
-async function runWorkflow(nativeArguments, cwd) {
-  const run = await startWorkflow(nativeArguments, cwd);
+async function runWorkflow(nativeArguments, cwd, allowEdits) {
+  const run = await startWorkflow(nativeArguments, cwd, allowEdits);
   while (!run.terminal) await delay(POLL_INTERVAL_MS);
   if (run.status === "completed") return run.terminalState;
   if (run.status === "killed") throw new Error("Workflow was killed");

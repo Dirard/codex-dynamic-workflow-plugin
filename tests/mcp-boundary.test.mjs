@@ -244,7 +244,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.4.0");
+  assert.equal(initialized.serverInfo.version, "0.5.0");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -325,7 +325,12 @@ function writeState(status = "completed") {
     JSON.stringify({
       runId,
       status,
-      result: { cwd: process.cwd() },
+      result: {
+        cwd: process.cwd(),
+        argv: process.argv.slice(2),
+        model: process.env.ANTHROPIC_MODEL,
+        subagentModel: process.env.CLAUDE_CODE_SUBAGENT_MODEL,
+      },
     }),
   );
 }
@@ -683,6 +688,7 @@ test("plugin starts its bundled native-workflow adapter", () => {
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
+    "WORKFLOW_MODEL",
     "WORKFLOW_MIN_QUOTA_REMAINING_PERCENT",
     "WORKFLOW_QUOTA_URL",
     "XDG_CONFIG_HOME",
@@ -849,6 +855,14 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
     "WorkflowWait",
   ]);
   assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
+  assert.equal(
+    byName.WorkflowStart.inputSchema.properties.allowEdits.type,
+    "boolean",
+  );
+  assert.match(
+    byName.WorkflowStart.inputSchema.properties.allowEdits.description,
+    /acceptEdits.*cwd/i,
+  );
   assert.match(byName.WorkflowStart.description, /exact JavaScript/i);
   assert.match(
     byName.WorkflowStart.inputSchema.properties.script.description,
@@ -1240,6 +1254,79 @@ test("Workflow runs Claude in the requested workspace", async (t) => {
   });
   assertToolSuccess(result, "Workflow");
   assert.equal(parseToolPayload(result).result.cwd, workspace);
+});
+
+test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    WORKFLOW_MODEL: "glm-custom",
+  });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "editable", description: "Editable" };\nreturn { ok: true };',
+      allowEdits: true,
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.deepEqual(completed.result.argv, [
+    "--permission-mode",
+    "acceptEdits",
+    "mcp",
+    "serve",
+  ]);
+  assert.equal(completed.result.model, "glm-custom");
+  assert.equal(completed.result.subagentModel, "glm-custom");
+});
+
+test("Workflow defaults Claude to glm-5.3 without edit mode", async (t) => {
+  const configHome = await mkdtemp(join(tmpdir(), "workflow-model-default-"));
+  t.after(() => rm(configHome, { recursive: true, force: true }));
+  const { client } = await startFakeModeClient(t, "complete", {
+    WORKFLOW_MODEL: "",
+    XDG_CONFIG_HOME: configHome,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "Workflow",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "default-model", description: "Default model" };\nreturn { ok: true };',
+    },
+  });
+  assertToolSuccess(result, "Workflow");
+  const payload = parseToolPayload(result).result;
+  assert.deepEqual(payload.argv, ["mcp", "serve"]);
+  assert.equal(payload.model, "glm-5.3");
+  assert.equal(payload.subagentModel, "glm-5.3");
+});
+
+test("Workflow rejects a non-boolean allowEdits before Claude starts", async (t) => {
+  const marker = join(tmpdir(), `workflow-invalid-edits-${process.pid}`);
+  await rm(marker, { force: true });
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_MARKER: marker,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "invalid-edits", description: "Invalid" };',
+      allowEdits: "yes",
+    },
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, "Workflow allowEdits must be a boolean");
+  assert.equal(existsSync(marker), false);
 });
 
 test("WorkflowStart returns before terminal state and WorkflowWait returns the result", async (t) => {
