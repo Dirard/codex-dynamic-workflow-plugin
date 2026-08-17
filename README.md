@@ -42,8 +42,8 @@ chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env"
 конечные значения `0..100`, включая дробные. Значение `0` полностью отключает
 preflight-запрос. Публичный tool `WorkflowQuota` без аргументов всегда делает
 запрос и возвращает только `level`, `usedPercent`, `remainingPercent` и
-`resetAt` (epoch milliseconds). Authorization содержит значение Z.AI token
-без префикса `Bearer`.
+`resetAt` (epoch milliseconds либо `null`, пока окно ещё не стартовало).
+Authorization содержит значение Z.AI token без префикса `Bearer`.
 
 ## Использование
 

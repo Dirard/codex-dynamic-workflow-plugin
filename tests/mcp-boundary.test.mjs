@@ -244,7 +244,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.0");
+  assert.equal(initialized.serverInfo.version, "0.5.1");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -880,23 +880,27 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   });
 });
 
-test("WorkflowQuota uses the raw token and returns only the nearest five-hour model quota", async (t) => {
-  const nearReset = Date.now() + 3_600_000;
+test("WorkflowQuota identifies the five-hour quota before its reset starts", async (t) => {
   const quota = await startQuotaServer(t, [
     {
-      type: "TOKENS_LIMIT",
+      type: "TIME_LIMIT",
+      unit: 5,
+      number: 1,
       percentage: 10,
       nextResetTime: Date.now() + 7 * 24 * 3_600_000,
     },
     {
-      type: "TIME_LIMIT",
+      type: "TOKENS_LIMIT",
+      unit: 4,
+      number: 1,
       percentage: 99,
       nextResetTime: Date.now() + 600_000,
     },
     {
       type: "TOKENS_LIMIT",
+      unit: 3,
+      number: 5,
       percentage: 25.5,
-      nextResetTime: nearReset,
     },
   ]);
   const client = startClient({
@@ -923,7 +927,7 @@ test("WorkflowQuota uses the raw token and returns only the nearest five-hour mo
     level: "max",
     usedPercent: 25.5,
     remainingPercent: 74.5,
-    resetAt: nearReset,
+    resetAt: null,
   });
   assert.deepEqual(quota.requests.map((request) => request.method), ["GET"]);
   assert.equal(quota.requests[0].url, "/quota");
@@ -935,6 +939,8 @@ test("a decimal custom quota threshold blocks WorkflowStart before Claude spawns
   const quota = await startQuotaServer(t, [
     {
       type: "TOKENS_LIMIT",
+      unit: 3,
+      number: 5,
       percentage: 87.6,
       nextResetTime: Date.now() + 3_600_000,
     },
@@ -978,6 +984,8 @@ test("the default threshold allows exactly fifty percent remaining", async (t) =
   const quota = await startQuotaServer(t, [
     {
       type: "TOKENS_LIMIT",
+      unit: 3,
+      number: 5,
       percentage: 50,
       nextResetTime: Date.now() + 3_600_000,
     },
@@ -1006,6 +1014,8 @@ test("a zero threshold disables the quota request but still starts Claude", asyn
   const quota = await startQuotaServer(t, [
     {
       type: "TOKENS_LIMIT",
+      unit: 3,
+      number: 5,
       percentage: 0,
       nextResetTime: Date.now() + 3_600_000,
     },
@@ -1112,7 +1122,12 @@ test("WorkflowQuota fails closed when quota response is not JSON", async (t) => 
 
 test("WorkflowQuota fails closed when quota usage percent is invalid", async (t) => {
   const quota = await startQuotaServer(t, [
-      { type: "TOKENS_LIMIT", nextResetTime: Date.now() + 3_600_000 },
+      {
+        type: "TOKENS_LIMIT",
+        unit: 3,
+        number: 5,
+        nextResetTime: Date.now() + 3_600_000,
+      },
     ]);
   const client = await startQuotaClient(t, quota.url);
   await assertQuotaFailure(

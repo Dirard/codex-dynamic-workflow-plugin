@@ -1,7 +1,7 @@
 {
   "name": "codex-dynamic-workflow-plugin",
-  "version": "0.5.0",
-  "description": "Codex планирует native Claude Code workflows, а настраиваемая GLM выполняет leaf-задачи.",
+  "version": "0.5.1",
+  "description": "Codex \u043f\u043b\u0430\u043d\u0438\u0440\u0443\u0435\u0442 native Claude Code workflows, \u0430 \u043d\u0430\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u0435\u043c\u0430\u044f GLM \u0432\u044b\u043f\u043e\u043b\u043d\u044f\u0435\u0442 leaf-\u0437\u0430\u0434\u0430\u0447\u0438.",
   "author": {
     "name": "Dirard",
     "email": "ardaginaa@gmail.com",
@@ -18,8 +18,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Codex Dynamic Workflow",
-    "shortDescription": "Codex планирует, GLM исполняет",
-    "longDescription": "Запускает точные Claude Code Dynamic Workflow scripts, полностью спланированные Codex, и показывает observable phase, role и leaf status без общего execution deadline.",
+    "shortDescription": "Codex \u043f\u043b\u0430\u043d\u0438\u0440\u0443\u0435\u0442, GLM \u0438\u0441\u043f\u043e\u043b\u043d\u044f\u0435\u0442",
+    "longDescription": "\u0417\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u0442 \u0442\u043e\u0447\u043d\u044b\u0435 Claude Code Dynamic Workflow scripts, \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u0441\u043f\u043b\u0430\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0435 Codex, \u0438 \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u0442 observable phase, role \u0438 leaf status \u0431\u0435\u0437 \u043e\u0431\u0449\u0435\u0433\u043e execution deadline.",
     "developerName": "Dirard",
     "category": "Developer Tools",
     "capabilities": [
@@ -27,8 +27,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Используй $codex-dynamic-workflow-plugin:native-workflow для точного workflow.",
-      "Запусти $codex-dynamic-workflow-plugin:native-workflow для параллельного анализа."
+      "\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439 $codex-dynamic-workflow-plugin:native-workflow \u0434\u043b\u044f \u0442\u043e\u0447\u043d\u043e\u0433\u043e workflow.",
+      "\u0417\u0430\u043f\u0443\u0441\u0442\u0438 $codex-dynamic-workflow-plugin:native-workflow \u0434\u043b\u044f \u043f\u0430\u0440\u0430\u043b\u043b\u0435\u043b\u044c\u043d\u043e\u0433\u043e \u0430\u043d\u0430\u043b\u0438\u0437\u0430."
     ]
   }
 }

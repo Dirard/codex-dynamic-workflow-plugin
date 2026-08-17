@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.5.1";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -263,19 +263,16 @@ function parseQuotaResponse(payload) {
     throw new Error("Z.AI quota response has no five-hour model quota");
   }
 
-  const fiveHourWindows = limits.filter(
+  const quota = limits.find(
     (limit) =>
       limit?.type === "TOKENS_LIMIT" &&
-      Number.isFinite(limit.nextResetTime) &&
-      limit.nextResetTime > 0,
+      limit.unit === 3 &&
+      limit.number === 5,
   );
-  if (!fiveHourWindows.length) {
+  if (!quota) {
     throw new Error("Z.AI quota response has no five-hour model quota");
   }
 
-  const quota = fiveHourWindows.reduce((nearest, current) =>
-    current.nextResetTime < nearest.nextResetTime ? current : nearest,
-  );
   const usedPercent = quota.percentage;
   if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) {
     throw new Error("Z.AI quota response has an invalid model usage percent");
@@ -285,7 +282,10 @@ function parseQuotaResponse(payload) {
     level,
     usedPercent,
     remainingPercent: Number((100 - usedPercent).toFixed(6)),
-    resetAt: quota.nextResetTime,
+    resetAt:
+      Number.isFinite(quota.nextResetTime) && quota.nextResetTime > 0
+        ? quota.nextResetTime
+        : null,
   };
 }
 
