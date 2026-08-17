@@ -5,9 +5,10 @@ import { open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.1";
+const SERVER_VERSION = "0.5.2";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -563,25 +564,22 @@ async function startWorkflow(nativeArguments, cwd, allowEdits) {
       terminalState: undefined,
       result: undefined,
       terminal: false,
+      childExited: false,
     };
     runs.set(run.runId, run);
     native.child.once("exit", () => {
-      if (run.terminal) return;
-      run.failureMessage = "Claude Code stopped before workflow completion";
-      finishRun(run, "failed");
+      run.childExited = true;
     });
     if (native.child.exitCode !== null || native.child.signalCode !== null) {
-      run.failureMessage = "Claude Code stopped before workflow completion";
-      finishRun(run, "failed");
-    } else {
-      void watchRun(run).catch((error) => {
-        run.failureMessage =
-          error instanceof Error
-            ? error.message
-            : "Unable to read workflow progress";
-        finishRun(run, "failed");
-      });
+      run.childExited = true;
     }
+    void watchRun(run).catch((error) => {
+      run.failureMessage =
+        error instanceof Error
+          ? error.message
+          : "Unable to read workflow progress";
+      finishRun(run, "failed");
+    });
     return run;
   } catch (error) {
     native.close();
@@ -590,18 +588,192 @@ async function startWorkflow(nativeArguments, cwd, allowEdits) {
 }
 
 function startNativeClient(cwd, allowEdits) {
+  if (allowEdits) return startNativeSessionClient(cwd);
+  return startNativeMcpClient(cwd);
+}
+
+function workflowEnvironment(model) {
+  return {
+    ...process.env,
+    CLAUDE_CODE_WORKFLOWS: "1",
+    ANTHROPIC_MODEL: model,
+    CLAUDE_CODE_SUBAGENT_MODEL: model,
+  };
+}
+
+function startNativeSessionClient(cwd) {
   const model = process.env.WORKFLOW_MODEL?.trim() || "glm-5.3";
-  const claudeArgs = allowEdits
-    ? ["--permission-mode", "acceptEdits", "mcp", "serve"]
-    : ["mcp", "serve"];
-  const child = spawn("claude", claudeArgs, {
-    cwd,
-    env: {
-      ...process.env,
-      CLAUDE_CODE_WORKFLOWS: "1",
-      ANTHROPIC_MODEL: model,
-      CLAUDE_CODE_SUBAGENT_MODEL: model,
+  let child;
+  let reader;
+  let launchPromise;
+  let closed = false;
+
+  const request = (method, params) => {
+    if (method === "initialize") return Promise.resolve({});
+    if (method !== "tools/call" || params?.name !== "Workflow") {
+      return Promise.reject(new Error("Unsupported Claude Code request"));
+    }
+    if (launchPromise) {
+      return Promise.reject(new Error("Claude Code workflow already requested"));
+    }
+
+    const expectedInput = params.arguments;
+    child = spawn(
+      "claude",
+      [
+        "-p",
+        "--permission-mode",
+        "acceptEdits",
+        "--allowedTools",
+        "Workflow",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+      ],
+      {
+        cwd,
+        env: workflowEnvironment(model),
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    children.add(child);
+    child.stderr.resume();
+    reader = createInterface({ input: child.stdout });
+
+    launchPromise = new Promise((resolveLaunch, rejectLaunch) => {
+      let toolUseId;
+      let settled = false;
+      const timer = setTimeout(
+        () => fail(new Error("Claude Code did not launch the workflow")),
+        120_000,
+      );
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        rejectLaunch(error);
+      };
+
+      child.on("error", fail);
+      child.on("exit", () =>
+        fail(new Error("Claude Code stopped before launching the workflow")),
+      );
+      child.stdin.on("error", fail);
+      reader.on("line", (line) => {
+        if (settled) return;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          fail(new Error("Claude Code returned invalid session output"));
+          return;
+        }
+
+        if (message?.type === "result" && message.is_error === true) {
+          fail(
+            new Error(
+              typeof message.result === "string" && message.result.trim()
+                ? message.result.trim().slice(0, 2048)
+                : "Claude Code rejected the workflow",
+            ),
+          );
+          return;
+        }
+
+        const blocks = message?.message?.content;
+        if (!Array.isArray(blocks)) return;
+        for (const block of blocks) {
+          if (block?.type === "tool_use") {
+            if (
+              block.name !== "Workflow" ||
+              toolUseId ||
+              !isDeepStrictEqual(block.input, expectedInput)
+            ) {
+              fail(new Error("Claude Code changed the workflow request"));
+              return;
+            }
+            toolUseId = block.id;
+          }
+          if (
+            block?.type === "tool_result" &&
+            toolUseId &&
+            block.tool_use_id === toolUseId
+          ) {
+            const text =
+              typeof block.content === "string" ? block.content.trim() : "";
+            if (block.is_error || !text) {
+              fail(
+                new Error(
+                  text.slice(0, 2048) || "Claude Code rejected the workflow",
+                ),
+              );
+              return;
+            }
+            const runId = text.match(
+              /^Run ID:\s*(wf_[a-z0-9-]{6,})\s*$/m,
+            )?.[1];
+            const scriptPath = text
+              .match(/^Script file:\s*(.+)\s*$/m)?.[1]
+              ?.trim();
+            settled = true;
+            clearTimeout(timer);
+            resolveLaunch({
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    status: "async_launched",
+                    runId,
+                    scriptPath,
+                  }),
+                },
+              ],
+              isError: false,
+            });
+            return;
+          }
+        }
+      });
+    });
+
+    child.stdin.end(
+      [
+        "Act only as a transport for Codex.",
+        "Call the Workflow tool exactly once with the exact JSON input below.",
+        "Do not call any other tool, alter the input, plan, or execute the task yourself.",
+        "<workflow-input>",
+        JSON.stringify(expectedInput),
+        "</workflow-input>",
+      ].join("\n"),
+    );
+    return launchPromise;
+  };
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    reader?.close();
+    if (child?.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+    }
+    children.delete(child);
+  };
+
+  return {
+    get child() {
+      return child;
     },
+    request,
+    notify() {},
+    close,
+  };
+}
+
+function startNativeMcpClient(cwd) {
+  const model = process.env.WORKFLOW_MODEL?.trim() || "glm-5.3";
+  const child = spawn("claude", ["mcp", "serve"], {
+    cwd,
+    env: workflowEnvironment(model),
     stdio: ["pipe", "pipe", "pipe"],
   });
   children.add(child);
@@ -1005,10 +1177,19 @@ async function watchRun(run) {
     await waitAtTestGate(run, "after-journal");
     if (run.terminal) return;
 
-    const state = await readNativeState(run);
+    let state = await readNativeState(run);
     if (run.terminal) return;
+    if (!state && run.childExited) {
+      state = await readNativeState(run);
+      if (run.terminal) return;
+    }
     if (state) {
       await finishFromNativeState(run, state);
+      return;
+    }
+    if (run.childExited) {
+      run.failureMessage = "Claude Code stopped before workflow completion";
+      finishRun(run, "failed");
       return;
     }
     await delay(POLL_INTERVAL_MS);

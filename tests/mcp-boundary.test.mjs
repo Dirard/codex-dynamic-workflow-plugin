@@ -90,6 +90,35 @@ const synthesis = await leaf(
 
 return { structure, documentation, synthesis };`;
 
+const editCanaryScript = `export const meta = {
+  name: "editable-workspace-canary",
+  description: "Verify that a workflow leaf can write in the requested workspace",
+  phases: [
+    {
+      title: "Edit",
+      detail: "Create and verify one diagnostic file",
+    },
+  ],
+};
+
+function leaf(phaseName, role, label, prompt, options = {}) {
+  const progress = JSON.stringify({ phase: phaseName, role, label });
+  return agent(
+    \`<codex-workflow-progress>\${progress}</codex-workflow-progress>\\n\${prompt}\`,
+    { ...options, label, phase: phaseName },
+  );
+}
+
+phase("Edit");
+const result = await leaf(
+  "Edit",
+  "implementation",
+  "write-diagnostic",
+  "Use the Write tool, not Bash or Edit, to create diagnostic.txt in the current workspace with the exact UTF-8 contents workflow edit canary followed by one newline. Then use Read to verify it. If permission is denied, report that honestly.",
+);
+
+return { result };`;
+
 function parseToolPayload(result) {
   const text = result.content?.find((item) => item.type === "text")?.text;
   assert.ok(text, `Missing MCP text result: ${JSON.stringify(result)}`);
@@ -244,7 +273,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.1");
+  assert.equal(initialized.serverInfo.version, "0.5.2");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -293,6 +322,7 @@ const transcriptRoot = path.join(
   runId,
 );
 const journalPath = path.join(transcriptRoot, "journal.jsonl");
+let receivedWorkflowInput;
 const respond = (id, result) => {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
 };
@@ -330,6 +360,7 @@ function writeState(status = "completed") {
         argv: process.argv.slice(2),
         model: process.env.ANTHROPIC_MODEL,
         subagentModel: process.env.CLAUDE_CODE_SUBAGENT_MODEL,
+        workflowInput: receivedWorkflowInput,
       },
     }),
   );
@@ -393,7 +424,65 @@ function scheduleState(status, delay = 50) {
   setTimeout(() => writeState(status), delay);
 }
 
-readline.createInterface({ input: process.stdin }).on("line", (line) => {
+if (process.argv.includes("-p")) {
+  let prompt = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    prompt += chunk;
+  });
+  process.stdin.on("end", () => {
+    const match = prompt.match(/<workflow-input>([\\s\\S]+)<\\/workflow-input>/);
+    if (!match) process.exit(2);
+    receivedWorkflowInput = JSON.parse(match[1]);
+    if (process.env.FAKE_WORKFLOW_MUTATE_INPUT === "1") {
+      receivedWorkflowInput = {
+        ...receivedWorkflowInput,
+        script: receivedWorkflowInput.script + "\\n// changed",
+      };
+    }
+    resetRunFiles();
+    if (process.env.FAKE_WORKFLOW_EXIT_AFTER_STATE === "1") {
+      writeState("completed");
+    } else {
+      scheduleState("completed");
+    }
+    const toolUseId = "call_workflow_fixture";
+    process.stdout.write(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{
+            type: "tool_use",
+            id: toolUseId,
+            name: "Workflow",
+            input: receivedWorkflowInput,
+          }],
+        },
+      }) + "\\n",
+    );
+    process.stdout.write(
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [{
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content:
+              "Workflow launched in background.\\n" +
+              "Script file: " + path.join(stateRoot, "scripts", "workflow.js") + "\\n" +
+              "Run ID: " + runId + "\\n",
+            is_error: false,
+          }],
+        },
+      }) + "\\n",
+    );
+    if (process.env.FAKE_WORKFLOW_EXIT_AFTER_STATE === "1") {
+      setImmediate(() => process.exit(0));
+    } else {
+      setInterval(() => {}, 1_000);
+    }
+  });
+} else readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (!Object.hasOwn(message, "id")) return;
   if (message.method === "initialize") {
@@ -406,6 +495,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (message.method !== "tools/call") return;
 
+  receivedWorkflowInput = message.params?.arguments;
   resetRunFiles();
   const mode =
     process.env.FAKE_WORKFLOW_PROGRESS === "1" ? "progress" : readMode();
@@ -1291,13 +1381,63 @@ test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t
     parseToolPayload(started).runId,
   );
   assert.deepEqual(completed.result.argv, [
+    "-p",
     "--permission-mode",
     "acceptEdits",
-    "mcp",
-    "serve",
+    "--allowedTools",
+    "Workflow",
+    "--output-format",
+    "stream-json",
+    "--verbose",
   ]);
   assert.equal(completed.result.model, "glm-custom");
   assert.equal(completed.result.subagentModel, "glm-custom");
+  assert.deepEqual(completed.result.workflowInput, {
+    script:
+      'export const meta = { name: "editable", description: "Editable" };\nreturn { ok: true };',
+  });
+});
+
+test("WorkflowStart rejects changed editable workflow input", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_MUTATE_INPUT: "1",
+  });
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "changed", description: "Changed" };\nreturn { ok: true };',
+      allowEdits: true,
+    },
+  });
+
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, "Claude Code changed the workflow request");
+});
+
+test("editable workflow consumes terminal state when print session exits", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_EXIT_AFTER_STATE: "1",
+  });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "exit", description: "Exit" };\nreturn { ok: true };',
+      allowEdits: true,
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(completed.status, "completed");
+  assert.equal(terminalWorkflowEvents(completed).length, 1);
+  assert.equal(terminalWorkflowEvents(completed)[0].type, "workflow_completed");
 });
 
 test("Workflow defaults Claude to glm-5.3 without edit mode", async (t) => {
@@ -2050,5 +2190,48 @@ test(
       assert.notEqual(completed.result[key], null);
       assert.ok(completed.result[key].summary.trim());
     }
+  },
+);
+
+test(
+  "allowEdits lets a real workflow leaf create a file",
+  { skip: process.env.RUN_WORKFLOW_EDIT_CANARY !== "1" },
+  async (t) => {
+    const workspace = await mkdtemp(join(tmpdir(), "workflow-edit-canary-"));
+    const client = startClient();
+    t.after(() => client.stop());
+    t.after(() => rm(workspace, { recursive: true, force: true }));
+    const deadline = Date.now() + 620_000;
+
+    await initialize(client);
+    const started = await client.request(
+      "tools/call",
+      {
+        name: "WorkflowStart",
+        arguments: {
+          cwd: workspace,
+          script: editCanaryScript,
+          allowEdits: true,
+        },
+      },
+      120_000,
+    );
+    assertToolSuccess(started, "WorkflowStart");
+    const completed = await waitWorkflowToTerminal(
+      client,
+      parseToolPayload(started),
+      deadline,
+    );
+
+    assert.equal(completed.status, "completed");
+    assert.equal(
+      existsSync(join(workspace, "diagnostic.txt")),
+      true,
+      JSON.stringify(completed.result),
+    );
+    assert.equal(
+      await readFile(join(workspace, "diagnostic.txt"), "utf8"),
+      "workflow edit canary\n",
+    );
   },
 );

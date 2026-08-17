@@ -83,12 +83,14 @@ Provider URL и credentials не передаются leaf agents через п�
 ```bash
 node --test tests/mcp-boundary.test.mjs
 RUN_WORKFLOW_CANARY=1 node --test tests/mcp-boundary.test.mjs
+RUN_WORKFLOW_EDIT_CANARY=1 node --test tests/mcp-boundary.test.mjs
 ```
 
 Canary запускает два параллельных GLM reviewer leaf и зависимый synthesis leaf,
-наблюдая их через async lifecycle. В Claude Code 2.1.204 custom agent tool
-restrictions недоступны через `mcp serve`: leaf получает стандартные Claude
-Code tools, включая `Bash`, `Edit` и `Write`. Prompt-based read-only означает
+наблюдая их через async lifecycle. Edit-canary проверяет реальную запись leaf.
+В Claude Code 2.1.233 `mcp serve` фиксирует default permission context, поэтому
+`allowEdits: true` использует полноценную print/SDK session с `acceptEdits`, а
+read-only path остаётся на `mcp serve`. Prompt-based read-only означает
 намерение, а не sandbox или permissions boundary. Codex approval относится
 только к внешнему MCP-вызову; sandbox profile Codex автоматически не
 применяется внутри MCP. Для гарантии используйте permissions/settings Claude
