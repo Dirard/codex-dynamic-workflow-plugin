@@ -276,7 +276,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.5");
+  assert.equal(initialized.serverInfo.version, "0.5.6");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -1297,7 +1297,8 @@ test("WorkflowStart preserves Claude Code's rejection reason", async (t) => {
     name: "WorkflowStart",
     arguments: {
       cwd: repositoryRoot,
-      script: "This is not JavaScript",
+      script:
+        'export const meta = { name: "rejected", description: "Rejected" };\nreturn null;',
     },
   });
 
@@ -1605,6 +1606,29 @@ test("Workflow rejects a non-boolean allowEdits before Claude starts", async (t)
   });
   assert.equal(result.isError, true);
   assert.equal(result.content[0].text, "Workflow allowEdits must be a boolean");
+  assert.equal(existsSync(marker), false);
+});
+
+test("WorkflowStart rejects a natural-language script before Claude starts", async (t) => {
+  const marker = join(tmpdir(), `workflow-natural-language-${process.pid}`);
+  await rm(marker, { force: true });
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_MARKER: marker,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script: "простой текст",
+      allowEdits: true,
+    },
+  });
+  assert.equal(result.isError, true);
+  assert.equal(
+    result.content[0].text,
+    'Workflow script must start with "export const meta = {"; pass Dynamic Workflow JavaScript, not a natural-language task',
+  );
   assert.equal(existsSync(marker), false);
 });
 

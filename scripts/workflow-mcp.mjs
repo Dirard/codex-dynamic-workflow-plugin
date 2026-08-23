@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.5";
+const SERVER_VERSION = "0.5.6";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -479,6 +479,9 @@ function validateArguments(args) {
   }
   if (args.script.length > MAX_SCRIPT_LENGTH) {
     return "Workflow script is too large";
+  }
+  if (!/^\s*export\s+const\s+meta\s*=\s*\{/.test(args.script)) {
+    return 'Workflow script must start with "export const meta = {"; pass Dynamic Workflow JavaScript, not a natural-language task';
   }
   if (
     Object.hasOwn(args, "allowEdits") &&
