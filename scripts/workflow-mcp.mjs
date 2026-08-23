@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.4";
+const SERVER_VERSION = "0.5.5";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -81,7 +81,7 @@ const workflowQuotaTool = {
 };
 
 const workflowWaitTool = {
-  name: "WorkflowWait",
+  name: "GetWorkflowStatus",
   description:
     "Call directly to wait for a workflow revision or terminal state. Do not wrap this tool in a background execution shell.",
   inputSchema: {
@@ -356,7 +356,7 @@ async function handleMessage(message) {
         },
         instructions:
           "Pass exact Dynamic Workflow JavaScript, never a natural-language task, to WorkflowStart. " +
-          "Then call WorkflowWait with the latest revision until terminal. " +
+          "Then call GetWorkflowStatus with the latest revision until terminal. " +
           "Report phase/role/leaf changes. Use WorkflowStop when the run is cancelled.",
       });
       return;
@@ -383,7 +383,7 @@ async function callTool(params) {
         return await callWorkflow(params.arguments, true);
       case "WorkflowQuota":
         return await callWorkflowQuota(params.arguments);
-      case "WorkflowWait":
+      case "GetWorkflowStatus":
         return await callWorkflowWait(params.arguments);
       case "WorkflowStop":
         return callWorkflowStop(params.arguments);
@@ -441,7 +441,7 @@ async function callWorkflowWait(args) {
   if (!run) return toolError("Unknown workflow run");
   if (args.afterRevision > run.revision) {
     return toolError(
-      "WorkflowWait afterRevision cannot exceed current revision",
+      "GetWorkflowStatus afterRevision cannot exceed current revision",
     );
   }
   return toolSuccess(await waitForUpdate(run, args.afterRevision));
@@ -491,20 +491,20 @@ function validateArguments(args) {
 
 function validateWaitArguments(args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
-    return "WorkflowWait arguments must be an object";
+    return "GetWorkflowStatus arguments must be an object";
   }
   if (
     Object.keys(args).some(
       (key) => key !== "runId" && key !== "afterRevision",
     )
   ) {
-    return "WorkflowWait received an unsupported argument";
+    return "GetWorkflowStatus received an unsupported argument";
   }
   if (typeof args.runId !== "string" || !args.runId) {
-    return "WorkflowWait runId must be a non-empty string";
+    return "GetWorkflowStatus runId must be a non-empty string";
   }
   if (!Number.isInteger(args.afterRevision) || args.afterRevision < 0) {
-    return "WorkflowWait afterRevision must be a non-negative integer";
+    return "GetWorkflowStatus afterRevision must be a non-negative integer";
   }
   return null;
 }

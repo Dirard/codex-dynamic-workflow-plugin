@@ -245,15 +245,15 @@ thorough audit — больше независимых finders, 3–5 votes и c
 символов. `role` — произвольный стабильный идентификатор задачи, не только
 reviewer preset.
 
-Запускать `WorkflowStart`, затем повторять `WorkflowWait` с последним
-`revision`. Wait возвращается только после новой revision или terminal state.
+Запускать `WorkflowStart`, затем повторять `GetWorkflowStatus` с последним
+`revision`. Инструмент возвращается только после новой revision или terminal state.
 Сообщать новые phase/role/leaf events. Общего execution deadline у async path
 нет. На отмену пользователя вызывать `WorkflowStop`; он будит pending Wait.
-`WorkflowWait` вызывать напрямую как MCP tool, без background/async shell,
+`GetWorkflowStatus` вызывать напрямую как MCP tool, без background/async shell,
 execution wrapper или отдельной фоновой сессии.
 
 `log()` остаётся полезен внутри native UI, но Codex считает источником live
-progress только `WorkflowWait`.
+progress только `GetWorkflowStatus`.
 
 ## 10. Resume и различия плагина
 

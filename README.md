@@ -60,8 +60,8 @@ Codex сформирует точный исполняемый JavaScript `scrip
 Claude стартует в `acceptEdits` для этого `cwd`, без bypass остальных
 permissions.
 
-`WorkflowWait` нужно вызывать напрямую как MCP tool с последним `revision`,
-не через background/async shell или execution wrapper. Wait сам удерживает
+`GetWorkflowStatus` нужно вызывать напрямую как MCP tool с последним `revision`,
+не через background/async shell или execution wrapper. Инструмент сам удерживает
 вызов до реального изменения phase/role/leaf или terminal state; периодические
 пустые ответы и polling по таймеру отсутствуют.
 

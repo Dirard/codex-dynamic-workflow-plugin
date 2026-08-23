@@ -56,12 +56,12 @@ real JSON в `args`. Не использовать imports, Node API, clocks/ran
    Claude `acceptEdits` для данного `cwd`, но не bypass остальных permissions.
 2. Сразу сообщить пользователю `runId` и первую запланированную phase.
 3. Напрямую вызвать MCP tool
-   `claude-workflow:WorkflowWait({ runId, afterRevision })`, передав последний
-   полученный `revision`. Не помещать Wait во внешний background/async shell,
-   execution wrapper или отдельную фоновую сессию: Wait сам блокируется до
-   новой revision или terminal state.
+   `claude-workflow:GetWorkflowStatus({ runId, afterRevision })`, передав
+   последний полученный `revision`. Не помещать GetWorkflowStatus во внешний
+   background/async shell, execution wrapper или отдельную фоновую сессию:
+   инструмент сам блокируется до новой revision или terminal state.
 4. После ответа сообщить только новые phase/role/leaf events и повторить
-   `WorkflowWait` с новой revision.
+   `GetWorkflowStatus` с новой revision.
 5. Продолжать без общего deadline до `completed`, `failed` или `killed`.
 6. При отмене, замене задачи или явной команде пользователя вызвать
    `claude-workflow:WorkflowStop({ runId })`; pending Wait вернёт killed state.
@@ -69,7 +69,7 @@ real JSON в `args`. Не использовать imports, Node API, clocks/ran
    решает, нужен ли следующий workflow.
 
 Старый `Workflow` остаётся compatibility tool; для новых и больших задач его
-не выбирать. `log()` — native diagnostic, не замена `WorkflowWait`.
+не выбирать. `log()` — native diagnostic, не замена `GetWorkflowStatus`.
 
 Prompt-based read-only не является sandbox. Leaf может видеть `Bash`, `Edit` и
 `Write`; технические ограничения задаются permissions Claude Code или

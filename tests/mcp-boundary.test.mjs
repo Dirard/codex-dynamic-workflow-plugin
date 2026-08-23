@@ -149,12 +149,12 @@ async function waitWorkflowToTerminal(
       const result = await client.request(
         "tools/call",
         {
-          name: "WorkflowWait",
+          name: "GetWorkflowStatus",
           arguments: { runId: launch.runId, afterRevision },
         },
         remaining,
       );
-      assertToolSuccess(result, "WorkflowWait");
+      assertToolSuccess(result, "GetWorkflowStatus");
       const snapshot = parseToolPayload(result);
       events.push(...snapshot.events);
       afterRevision = snapshot.revision;
@@ -214,7 +214,7 @@ test("canary waiting uses each returned revision until terminal", async () => {
     calls.map(({ params, timeout }) => ({ ...params, timeout })),
     [
       {
-        name: "WorkflowWait",
+        name: "GetWorkflowStatus",
         arguments: {
           runId: "wf_canary",
           afterRevision: 0,
@@ -222,7 +222,7 @@ test("canary waiting uses each returned revision until terminal", async () => {
         timeout: 40_000,
       },
       {
-        name: "WorkflowWait",
+        name: "GetWorkflowStatus",
         arguments: {
           runId: "wf_canary",
           afterRevision: 2,
@@ -276,7 +276,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.4");
+  assert.equal(initialized.serverInfo.version, "0.5.5");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -824,10 +824,10 @@ async function collectWorkflowEvents(client, runId) {
   const events = [];
   while (true) {
     const result = await client.request("tools/call", {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: { runId, afterRevision },
     });
-    assertToolSuccess(result, "WorkflowWait");
+    assertToolSuccess(result, "GetWorkflowStatus");
     const snapshot = parseToolPayload(result);
     events.push(...snapshot.events);
     afterRevision = snapshot.revision;
@@ -1003,11 +1003,11 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   const { tools } = await client.request("tools/list", {});
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
   assert.deepEqual(Object.keys(byName).sort(), [
+    "GetWorkflowStatus",
     "Workflow",
     "WorkflowQuota",
     "WorkflowStart",
     "WorkflowStop",
-    "WorkflowWait",
   ]);
   assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
   assert.equal(
@@ -1023,7 +1023,7 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
     byName.WorkflowStart.inputSchema.properties.script.description,
     /not.*natural-language task/i,
   );
-  assert.deepEqual(byName.WorkflowWait.inputSchema.required, [
+  assert.deepEqual(byName.GetWorkflowStatus.inputSchema.required, [
     "runId",
     "afterRevision",
   ]);
@@ -1608,7 +1608,7 @@ test("Workflow rejects a non-boolean allowEdits before Claude starts", async (t)
   assert.equal(existsSync(marker), false);
 });
 
-test("WorkflowStart returns before terminal state and WorkflowWait returns the result", async (t) => {
+test("WorkflowStart returns before terminal state and GetWorkflowStatus returns the result", async (t) => {
   const { fakeBin } = await createWorkflowClaude(t);
   const client = startClient({
     PATH: `${fakeBin}${delimiter}${process.env.PATH}`,
@@ -1633,10 +1633,10 @@ test("WorkflowStart returns before terminal state and WorkflowWait returns the r
   assert.equal(launch.revision, 0);
 
   const completed = await client.request("tools/call", {
-    name: "WorkflowWait",
+    name: "GetWorkflowStatus",
     arguments: { runId: launch.runId, afterRevision: 0 },
   });
-  assertToolSuccess(completed, "WorkflowWait");
+  assertToolSuccess(completed, "GetWorkflowStatus");
   const snapshot = parseToolPayload(completed);
   assert.equal(snapshot.status, "completed");
   assert.equal(snapshot.result.cwd, repositoryRoot);
@@ -1723,13 +1723,13 @@ test("closing adapter input terminates an active Claude workflow", async (t) => 
   await waitForFileText(marker, "terminated");
 });
 
-test("WorkflowWait reports revisioned leaf progress without transcript data", async (t) => {
+test("GetWorkflowStatus reports revisioned leaf progress without transcript data", async (t) => {
   const { client, stateRoot } = await startFakeProgressClient(t);
   const launch = await startFakeWorkflow(client);
 
   const running = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: { runId: launch.runId, afterRevision: 0 },
     }),
   );
@@ -1747,7 +1747,7 @@ test("WorkflowWait reports revisioned leaf progress without transcript data", as
   await writeFile(join(stateRoot, `${launch.runId}.release-result`), "");
   const leafCompleted = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: {
         runId: launch.runId,
         afterRevision: running.revision,
@@ -1773,7 +1773,7 @@ test("WorkflowWait reports revisioned leaf progress without transcript data", as
   await writeFile(join(stateRoot, `${launch.runId}.release-state`), "");
   const terminal = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: {
         runId: launch.runId,
         afterRevision: leafCompleted.revision,
@@ -1785,7 +1785,7 @@ test("WorkflowWait reports revisioned leaf progress without transcript data", as
   assert.ok(terminal.revision > leafCompleted.revision);
 });
 
-test("WorkflowWait stays pending until a complete first user record emits progress", async (t) => {
+test("GetWorkflowStatus stays pending until a complete first user record emits progress", async (t) => {
   const gate = await createWatcherGate(t, "after-journal");
   const { client, stateRoot } = await startFakeModeClient(
     t,
@@ -1798,7 +1798,7 @@ test("WorkflowWait stays pending until a complete first user record emits progre
   const waiting = client.request(
     "tools/call",
     {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: { runId: launch.runId, afterRevision: 0 },
     },
     2_000,
@@ -1870,7 +1870,7 @@ test("terminal drain forces fallback for a permanently missing progress transcri
   const waiting = client.request(
     "tools/call",
     {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: { runId: launch.runId, afterRevision: 0 },
     },
     2_000,
@@ -1906,7 +1906,7 @@ test("terminal drain forces fallback for a permanently missing progress transcri
   assert.equal(snapshot.counts.failed, 1);
 });
 
-test("WorkflowWait rejects unknown runs and invalid revision arguments safely", async (t) => {
+test("GetWorkflowStatus rejects unknown runs and invalid revision arguments safely", async (t) => {
   const client = startClient({
     ANTHROPIC_BASE_URL: "https://example.invalid",
     ANTHROPIC_AUTH_TOKEN: "placeholder",
@@ -1939,7 +1939,7 @@ test("WorkflowWait rejects unknown runs and invalid revision arguments safely", 
 
   for (const item of cases) {
     const result = await client.request("tools/call", {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: item.arguments,
     });
     assert.equal(result.isError, true);
@@ -1953,7 +1953,7 @@ test("WorkflowWait rejects unknown runs and invalid revision arguments safely", 
   const { client: runningClient } = await startFakeModeClient(t, "no-state");
   const launch = await startFakeWorkflow(runningClient);
   const future = await runningClient.request("tools/call", {
-    name: "WorkflowWait",
+    name: "GetWorkflowStatus",
     arguments: { runId: launch.runId, afterRevision: launch.revision + 1 },
   });
   assert.equal(future.isError, true);
@@ -2077,13 +2077,13 @@ test("bounded journal reads preserve split UTF-8 and emit each event once", asyn
   await waitForFileText(markerPath, "partial");
 });
 
-test("WorkflowWait stays pending until WorkflowStop advances the revision", async (t) => {
+test("GetWorkflowStatus stays pending until WorkflowStop advances the revision", async (t) => {
   const { client } = await startFakeModeClient(t, "no-state");
   const launch = await startFakeWorkflow(client);
   const waiting = client.request(
     "tools/call",
     {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: { runId: launch.runId, afterRevision: 0 },
     },
     2_000,
@@ -2198,7 +2198,7 @@ test("WorkflowStop wins over an already-read native terminal state", async (t) =
 
   const snapshot = parseToolPayload(
     await client.request("tools/call", {
-      name: "WorkflowWait",
+      name: "GetWorkflowStatus",
       arguments: { runId: launch.runId, afterRevision: 0 },
     }),
   );
