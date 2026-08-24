@@ -276,7 +276,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.6");
+  assert.equal(initialized.serverInfo.version, "0.5.7");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -995,7 +995,7 @@ async function assertQuotaFailure(client, message) {
   assert.equal(result.content[0].text, message);
 }
 
-test("configured MCP publishes the workflow lifecycle tools", async (t) => {
+test("configured MCP publishes only background workflow lifecycle tools", async (t) => {
   const client = startClient();
   t.after(() => client.stop());
   await initialize(client);
@@ -1004,7 +1004,6 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
   assert.deepEqual(Object.keys(byName).sort(), [
     "GetWorkflowStatus",
-    "Workflow",
     "WorkflowQuota",
     "WorkflowStart",
     "WorkflowStop",
@@ -1033,6 +1032,12 @@ test("configured MCP publishes the workflow lifecycle tools", async (t) => {
     properties: {},
     additionalProperties: false,
   });
+  const removed = await client.request("tools/call", {
+    name: "Workflow",
+    arguments: {},
+  });
+  assert.equal(removed.isError, true);
+  assert.equal(removed.content[0].text, "Unknown tool");
 });
 
 test("WorkflowQuota identifies the five-hour quota before its reset starts", async (t) => {
@@ -1117,17 +1122,7 @@ test("a decimal custom quota threshold blocks WorkflowStart before Claude spawns
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Z\.AI quota remaining is 12\.4%; minimum is 12\.5%/);
 
-  const legacyResult = await client.request("tools/call", {
-    name: "Workflow",
-    arguments: {
-      cwd: repositoryRoot,
-      script: 'export const meta = { name: "quota-blocked-legacy" };',
-    },
-  });
-  assert.equal(legacyResult.isError, true);
-  assert.match(legacyResult.content[0].text, /Z\.AI quota remaining is 12\.4%; minimum is 12\.5%/);
-
-  assert.equal(quota.requests.length, 2);
+  assert.equal(quota.requests.length, 1);
   assert.equal(existsSync(marker), false);
 });
 
@@ -1306,7 +1301,7 @@ test("WorkflowStart preserves Claude Code's rejection reason", async (t) => {
   assert.equal(result.content[0].text, "Workflow script must be JavaScript");
 });
 
-test("Workflow refuses to fall back when Z.AI provider env is missing", async (t) => {
+test("WorkflowStart refuses to fall back when Z.AI provider env is missing", async (t) => {
   const client = startClient({
     XDG_CONFIG_HOME: `/tmp/codex-workflow-no-provider-${process.pid}`,
     ANTHROPIC_BASE_URL: "",
@@ -1323,7 +1318,7 @@ test("Workflow refuses to fall back when Z.AI provider env is missing", async (t
   client.notify("notifications/initialized");
 
   const result = await client.request("tools/call", {
-    name: "Workflow",
+    name: "WorkflowStart",
     arguments: {
       cwd: repositoryRoot,
       script:
@@ -1334,7 +1329,7 @@ test("Workflow refuses to fall back when Z.AI provider env is missing", async (t
   assert.match(result.content[0].text, /ANTHROPIC_BASE_URL/);
 });
 
-test("Workflow rejects a relative workspace path", async (t) => {
+test("WorkflowStart rejects a relative workspace path", async (t) => {
   const client = startClient({
     ANTHROPIC_BASE_URL: "https://example.invalid",
     ANTHROPIC_AUTH_TOKEN: "placeholder",
@@ -1349,7 +1344,7 @@ test("Workflow rejects a relative workspace path", async (t) => {
   client.notify("notifications/initialized");
 
   const result = await client.request("tools/call", {
-    name: "Workflow",
+    name: "WorkflowStart",
     arguments: {
       cwd: "relative-workspace",
       script:
@@ -1360,7 +1355,7 @@ test("Workflow rejects a relative workspace path", async (t) => {
   assert.match(result.content[0].text, /absolute path/);
 });
 
-test("Workflow survives an early Claude stdin close", async (t) => {
+test("WorkflowStart survives an early Claude stdin close", async (t) => {
   const fakeBin = await mkdtemp(join(tmpdir(), "codex-workflow-claude-"));
   const fakeClaude = join(fakeBin, "claude");
   await writeFile(fakeClaude, "#!/bin/sh\nexec 0<&-\nsleep 1\n");
@@ -1384,7 +1379,7 @@ test("Workflow survives an early Claude stdin close", async (t) => {
   client.notify("notifications/initialized");
 
   const result = await client.request("tools/call", {
-    name: "Workflow",
+    name: "WorkflowStart",
     arguments: {
       cwd: repositoryRoot,
       script:
@@ -1395,7 +1390,7 @@ test("Workflow survives an early Claude stdin close", async (t) => {
   assert.match(result.content[0].text, /Claude Code stopped unexpectedly/);
 });
 
-test("Workflow runs Claude in the requested workspace", async (t) => {
+test("WorkflowStart runs Claude in the requested workspace", async (t) => {
   const { fakeBin, stateRoot } = await createWorkflowClaude(t);
   const workspace = await mkdtemp(join(tmpdir(), "codex-workflow-workspace-"));
   t.after(() => rm(workspace, { recursive: true, force: true }));
@@ -1415,16 +1410,20 @@ test("Workflow runs Claude in the requested workspace", async (t) => {
   });
   client.notify("notifications/initialized");
 
-  const result = await client.request("tools/call", {
-    name: "Workflow",
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
     arguments: {
       cwd: workspace,
       script:
         'export const meta = { name: "workspace", description: "Use the requested workspace" };\nreturn { ok: true };',
     },
   });
-  assertToolSuccess(result, "Workflow");
-  assert.equal(parseToolPayload(result).result.cwd, workspace);
+  assertToolSuccess(started, "WorkflowStart");
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(completed.result.cwd, workspace);
 });
 
 test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t) => {
@@ -1565,7 +1564,7 @@ test("editable workflow consumes terminal state when print session exits", async
   assert.equal(terminalWorkflowEvents(completed)[0].type, "workflow_completed");
 });
 
-test("Workflow defaults Claude to glm-5.3 without edit mode", async (t) => {
+test("WorkflowStart defaults Claude to glm-5.3 without edit mode", async (t) => {
   const configHome = await mkdtemp(join(tmpdir(), "workflow-model-default-"));
   t.after(() => rm(configHome, { recursive: true, force: true }));
   const { client } = await startFakeModeClient(t, "complete", {
@@ -1573,22 +1572,25 @@ test("Workflow defaults Claude to glm-5.3 without edit mode", async (t) => {
     XDG_CONFIG_HOME: configHome,
   });
 
-  const result = await client.request("tools/call", {
-    name: "Workflow",
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
     arguments: {
       cwd: repositoryRoot,
       script:
         'export const meta = { name: "default-model", description: "Default model" };\nreturn { ok: true };',
     },
   });
-  assertToolSuccess(result, "Workflow");
-  const payload = parseToolPayload(result).result;
+  assertToolSuccess(started, "WorkflowStart");
+  const payload = (await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  )).result;
   assert.deepEqual(payload.argv, ["mcp", "serve"]);
   assert.equal(payload.model, "glm-5.3");
   assert.equal(payload.subagentModel, "glm-5.3");
 });
 
-test("Workflow rejects a non-boolean allowEdits before Claude starts", async (t) => {
+test("WorkflowStart rejects a non-boolean allowEdits before Claude starts", async (t) => {
   const marker = join(tmpdir(), `workflow-invalid-edits-${process.pid}`);
   await rm(marker, { force: true });
   const { client } = await startFakeModeClient(t, "complete", {
@@ -1666,7 +1668,7 @@ test("WorkflowStart returns before terminal state and GetWorkflowStatus returns 
   assert.equal(snapshot.result.cwd, repositoryRoot);
 });
 
-test("Workflow reports a killed native run immediately", async (t) => {
+test("WorkflowStart reports a killed native run through status", async (t) => {
   const { fakeBin, stateRoot } = await createWorkflowClaude(t);
   const workspace = await mkdtemp(join(tmpdir(), "codex-workflow-workspace-"));
   t.after(() => rm(workspace, { recursive: true, force: true }));
@@ -1687,10 +1689,10 @@ test("Workflow reports a killed native run immediately", async (t) => {
   });
   client.notify("notifications/initialized");
 
-  const result = await client.request(
+  const started = await client.request(
     "tools/call",
     {
-      name: "Workflow",
+      name: "WorkflowStart",
       arguments: {
         cwd: workspace,
         script:
@@ -1699,11 +1701,16 @@ test("Workflow reports a killed native run immediately", async (t) => {
     },
     1_000,
   );
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /Workflow was killed/);
+  assertToolSuccess(started, "WorkflowStart");
+  const killed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(killed.status, "killed");
+  assert.equal(terminalWorkflowEvents(killed).at(-1).type, "workflow_killed");
 });
 
-test("closing adapter input terminates an active Claude workflow", async (t) => {
+test("closing adapter input terminates an active background workflow", async (t) => {
   const { fakeBin, stateRoot } = await createWorkflowClaude(t);
   const workspace = await mkdtemp(join(tmpdir(), "codex-workflow-workspace-"));
   const marker = join(stateRoot, "lifecycle");
@@ -1726,10 +1733,10 @@ test("closing adapter input terminates an active Claude workflow", async (t) => 
   });
   client.notify("notifications/initialized");
 
-  const workflow = client.request(
+  const started = await client.request(
     "tools/call",
     {
-      name: "Workflow",
+      name: "WorkflowStart",
       arguments: {
         cwd: workspace,
         script:
@@ -1738,12 +1745,9 @@ test("closing adapter input terminates an active Claude workflow", async (t) => 
     },
     2_000,
   );
+  assertToolSuccess(started, "WorkflowStart");
   await waitForFileText(marker, "running");
   client.closeInput();
-
-  const result = await workflow;
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /Claude Code stopped/);
   await waitForFileText(marker, "terminated");
 });
 

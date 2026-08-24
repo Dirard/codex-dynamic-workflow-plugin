@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.6";
+const SERVER_VERSION = "0.5.7";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -65,7 +65,7 @@ const workflowInputSchema = {
 const workflowStartTool = {
   name: "WorkflowStart",
   description:
-    "Start an exact JavaScript Claude Code Dynamic Workflow in a workspace.",
+    "Start an exact JavaScript Claude Code Dynamic Workflow in the background and return its run ID.",
   inputSchema: workflowInputSchema,
 };
 
@@ -108,19 +108,11 @@ const workflowStopTool = {
   },
 };
 
-const workflowTool = {
-  name: "Workflow",
-  description:
-    "Execute an exact Claude Code Dynamic Workflow script in a workspace and wait for completion.",
-  inputSchema: workflowInputSchema,
-};
-
 const tools = [
   workflowStartTool,
   workflowQuotaTool,
   workflowWaitTool,
   workflowStopTool,
-  workflowTool,
 ];
 
 const input = createInterface({ input: process.stdin });
@@ -377,10 +369,8 @@ async function handleMessage(message) {
 async function callTool(params) {
   try {
     switch (params?.name) {
-      case "Workflow":
-        return await callWorkflow(params.arguments, false);
       case "WorkflowStart":
-        return await callWorkflow(params.arguments, true);
+        return await callWorkflow(params.arguments);
       case "WorkflowQuota":
         return await callWorkflowQuota(params.arguments);
       case "GetWorkflowStatus":
@@ -397,19 +387,13 @@ async function callTool(params) {
   }
 }
 
-async function callWorkflow(args, asynchronous) {
+async function callWorkflow(args) {
   const validationError = validateArguments(args);
   if (validationError) return toolError(validationError);
 
   const nativeArguments = { script: args.script };
   if (Object.hasOwn(args, "args")) nativeArguments.args = args.args;
   const allowEdits = args.allowEdits === true;
-  if (!asynchronous) {
-    return toolSuccess(
-      await runWorkflow(nativeArguments, args.cwd, allowEdits),
-    );
-  }
-
   const run = await startWorkflow(nativeArguments, args.cwd, allowEdits);
   return toolSuccess({
     runId: run.runId,
@@ -1358,14 +1342,6 @@ async function waitForUpdate(run, afterRevision) {
 function stopWorkflow(run) {
   finishRun(run, "killed");
   return snapshotRun(run, 0);
-}
-
-async function runWorkflow(nativeArguments, cwd, allowEdits) {
-  const run = await startWorkflow(nativeArguments, cwd, allowEdits);
-  while (!run.terminal) await delay(POLL_INTERVAL_MS);
-  if (run.status === "completed") return run.terminalState;
-  if (run.status === "killed") throw new Error("Workflow was killed");
-  throw new Error(run.failureMessage || "Workflow failed");
 }
 
 function delay(ms) {

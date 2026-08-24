@@ -68,8 +68,7 @@ real JSON в `args`. Не использовать imports, Node API, clocks/ran
 7. Проверить terminal result и каждый ожидаемый leaf output. Только Codex
    решает, нужен ли следующий workflow.
 
-Старый `Workflow` остаётся compatibility tool; для новых и больших задач его
-не выбирать. `log()` — native diagnostic, не замена `GetWorkflowStatus`.
+`log()` — native diagnostic, не замена `GetWorkflowStatus`.
 
 Prompt-based read-only не является sandbox. Leaf может видеть `Bash`, `Edit` и
 `Write`; технические ограничения задаются permissions Claude Code или

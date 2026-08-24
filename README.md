@@ -36,7 +36,7 @@ chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/codex-dynamic-workflow-plugin/.env"
 `WORKFLOW_MODEL` задаёт модель основной Claude-сессии и всех leaf agents;
 по умолчанию используется `glm-5.3`.
 
-Перед `WorkflowStart` и legacy `Workflow` адаптер проверяет Z.AI квоту
+Перед `WorkflowStart` адаптер проверяет Z.AI квоту
 5-часового модельного окна и блокирует запуск, когда remaining percent меньше
 `WORKFLOW_MIN_QUOTA_REMAINING_PERCENT`. По умолчанию порог `50`; допустимы
 конечные значения `0..100`, включая дробные. Значение `0` полностью отключает
@@ -65,9 +65,8 @@ permissions.
 вызов до реального изменения phase/role/leaf или terminal state; периодические
 пустые ответы и polling по таймеру отсутствуют.
 
-У async path нет общего execution deadline. `WorkflowStop` явно отменяет run,
-будит pending Wait и возвращает killed state. Старый синхронный `Workflow`
-сохранён только для совместимости.
+У workflow нет общего execution deadline. `WorkflowStop` явно отменяет run,
+будит pending Wait и возвращает killed state.
 
 Bundled reference адаптирует native Claude Workflow guidance для произвольных
 Codex-planned DAG: `agent`, `pipeline`, `parallel`, `phase`, `log`, `args`,
