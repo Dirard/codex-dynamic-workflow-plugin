@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.5.7";
+const SERVER_VERSION = "0.5.8";
 const INNER_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_TRANSCRIPT_PREFIX_BYTES = 16 * 1024 * 1024;
 const JOURNAL_CHUNK_BYTES = 64 * 1024;
@@ -651,7 +651,10 @@ function startNativeSessionClient(cwd) {
       ],
       {
         cwd,
-        env: workflowEnvironment(model),
+        env: {
+          ...workflowEnvironment(model),
+          CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0",
+        },
         stdio: ["pipe", "pipe", "pipe"],
       },
     );

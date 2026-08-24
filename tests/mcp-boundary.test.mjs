@@ -276,7 +276,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.7");
+  assert.equal(initialized.serverInfo.version, "0.5.8");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -363,6 +363,8 @@ function writeState(status = "completed") {
         argv: process.argv.slice(2),
         model: process.env.ANTHROPIC_MODEL,
         subagentModel: process.env.CLAUDE_CODE_SUBAGENT_MODEL,
+        printBackgroundWaitCeilingMs:
+          process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? null,
         workflowInput: receivedWorkflowInput,
       },
     }),
@@ -544,7 +546,17 @@ if (process.argv.includes("-p")) {
     if (process.env.FAKE_WORKFLOW_EXIT_AFTER_STATE === "1") {
       setImmediate(() => process.exit(0));
     } else {
-      setInterval(() => {}, 1_000);
+      const printBackgroundWaitCeilingMs = Number(
+        process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? 600_000,
+      );
+      if (printBackgroundWaitCeilingMs > 0) {
+        setTimeout(() => {
+          writeState("killed");
+          setImmediate(() => process.exit(0));
+        }, printBackgroundWaitCeilingMs);
+      } else {
+        setInterval(() => {}, 1_000);
+      }
     }
   });
 } else readline.createInterface({ input: process.stdin }).on("line", (line) => {
@@ -1562,6 +1574,29 @@ test("editable workflow consumes terminal state when print session exits", async
   assert.equal(completed.status, "completed");
   assert.equal(terminalWorkflowEvents(completed).length, 1);
   assert.equal(terminalWorkflowEvents(completed)[0].type, "workflow_completed");
+});
+
+test("editable workflow disables Claude print background wind-down", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "25",
+  });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: {
+      cwd: repositoryRoot,
+      script:
+        'export const meta = { name: "print-wait", description: "Wait" };\nreturn { ok: true };',
+      allowEdits: true,
+    },
+  });
+  assertToolSuccess(started, "WorkflowStart");
+
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.result.printBackgroundWaitCeilingMs, "0");
 });
 
 test("WorkflowStart defaults Claude to glm-5.3 without edit mode", async (t) => {
