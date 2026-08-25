@@ -43,7 +43,17 @@ if (event) {
     }
 
     if (process.exitCode !== 2) {
-      if (!isDeepStrictEqual(event.tool_input, expectedInput)) {
+      let actualInput = event.tool_input;
+      if (
+        actualInput &&
+        typeof actualInput === "object" &&
+        typeof actualInput.args === "string"
+      ) {
+        try {
+          actualInput = { ...actualInput, args: JSON.parse(actualInput.args) };
+        } catch {}
+      }
+      if (!isDeepStrictEqual(actualInput, expectedInput)) {
         deny("The Workflow request does not match the Codex-planned input");
       } else {
         try {

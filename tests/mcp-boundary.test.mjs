@@ -29,98 +29,56 @@ const config = JSON.parse(
 );
 const server = config.mcpServers["claude-workflow"];
 
-const canaryScript = `export const meta = {
-  name: "readonly-parallel-canary",
-  description: "Run two independent read-only reviews and synthesize them",
-  phases: [
-    {
-      title: "Review",
-      detail: "Two read-only reviewers inspect the workspace in parallel",
-    },
-    {
-      title: "Synthesize",
-      detail: "Synthesize the independent reviews",
-    },
-  ],
+const workflowTask = (id, overrides = {}) => ({
+  id,
+  role: overrides.role ?? "analysis",
+  prompt:
+    overrides.prompt ?? `Complete task ${id} without modifying the workspace.`,
+  dependsOn: overrides.dependsOn ?? [],
+});
+
+const workflowArguments = ({
+  name = "fixture-workflow",
+  description = "Fixture workflow",
+  cwd = repositoryRoot,
+  tasks = [workflowTask("execute")],
+  allowEdits,
+} = {}) => {
+  const arguments_ = { cwd, name, description, tasks };
+  if (allowEdits !== undefined) arguments_.allowEdits = allowEdits;
+  return arguments_;
 };
 
-const RESULT_SCHEMA = {
-  type: "object",
-  properties: { summary: { type: "string" } },
-  required: ["summary"],
-  additionalProperties: false,
-};
-
-function leaf(phaseName, role, label, prompt, options = {}) {
-  const progress = JSON.stringify({ phase: phaseName, role, label });
-  return agent(
-    \`<codex-workflow-progress>\${progress}</codex-workflow-progress>\\n\${prompt}\`,
-    { ...options, label, phase: phaseName },
-  );
-}
-
-phase("Review");
-const [structure, documentation] = await parallel([
-  () =>
-    leaf(
-      "Review",
-      "architecture",
-      "review-architecture",
+const readonlyCanaryTasks = [
+  workflowTask("inspect-structure", {
+    role: "architecture",
+    prompt:
       "Inspect the workspace structure without modifying anything. Return a concise summary.",
-      { schema: RESULT_SCHEMA },
-    ),
-  () =>
-    leaf(
-      "Review",
-      "product",
-      "review-product",
+  }),
+  workflowTask("inspect-documentation", {
+    role: "product",
+    prompt:
       "Inspect project documentation without modifying anything. Return a concise summary.",
-      { schema: RESULT_SCHEMA },
-    ),
-]);
+  }),
+  workflowTask("synthesize-inspections", {
+    role: "synthesis",
+    dependsOn: ["inspect-structure", "inspect-documentation"],
+    prompt:
+      "Synthesize both supplied dependency results without new research. Return a concise summary.",
+  }),
+];
 
-phase("Synthesize");
-const synthesis = await leaf(
-  "Synthesize",
-  "synthesis",
-  "synthesize-reviews",
-  \`Synthesize both inspections without new research.\\n\${JSON.stringify({
-    structure,
-    documentation,
-  })}\`,
-  { schema: RESULT_SCHEMA },
-);
-
-return { structure, documentation, synthesis };`;
-
-const editCanaryScript = `export const meta = {
+const editCanaryArguments = workflowArguments({
   name: "editable-workspace-canary",
   description: "Verify that a workflow leaf can write in the requested workspace",
-  phases: [
-    {
-      title: "Edit",
-      detail: "Create and verify one diagnostic file",
-    },
+  tasks: [
+    workflowTask("write-diagnostic", {
+      role: "implementation",
+      prompt:
+        "Use the Write tool, not Bash or Edit, to create diagnostic.txt in the current workspace with the exact UTF-8 contents workflow edit canary followed by one newline. Then use Read to verify it. If permission is denied, report that honestly.",
+    }),
   ],
-};
-
-function leaf(phaseName, role, label, prompt, options = {}) {
-  const progress = JSON.stringify({ phase: phaseName, role, label });
-  return agent(
-    \`<codex-workflow-progress>\${progress}</codex-workflow-progress>\\n\${prompt}\`,
-    { ...options, label, phase: phaseName },
-  );
-}
-
-phase("Edit");
-const result = await leaf(
-  "Edit",
-  "implementation",
-  "write-diagnostic",
-  "Use the Write tool, not Bash or Edit, to create diagnostic.txt in the current workspace with the exact UTF-8 contents workflow edit canary followed by one newline. Then use Read to verify it. If permission is denied, report that honestly.",
-);
-
-return { result };`;
+});
 
 function parseToolPayload(result) {
   const text = result.content?.find((item) => item.type === "text")?.text;
@@ -276,7 +234,7 @@ async function initialize(client) {
     clientInfo: { name: "codex-workflow-test", version: "1.0.0" },
   });
   assert.equal(initialized.protocolVersion, "2025-06-18");
-  assert.equal(initialized.serverInfo.version, "0.5.8");
+  assert.equal(initialized.serverInfo.version, "0.6.0");
   client.notify("notifications/initialized");
   return initialized;
 }
@@ -497,6 +455,16 @@ if (process.argv.includes("-p")) {
     };
     const parallelDeniedId = "call_workflow_parallel_denied";
     const parallelExact = process.env.FAKE_WORKFLOW_PARALLEL_EXACT === "1";
+    const emittedWorkflowInput =
+      process.env.FAKE_WORKFLOW_STRING_ARGS === "1"
+        ? {
+            ...plannedWorkflowInput,
+            args: JSON.stringify(plannedWorkflowInput.args),
+          }
+        : receivedWorkflowInput;
+    if (process.env.FAKE_WORKFLOW_STRING_ARGS === "1") {
+      receivedWorkflowInput = emittedWorkflowInput;
+    }
     process.stdout.write(
       JSON.stringify({
         type: "assistant",
@@ -520,7 +488,7 @@ if (process.argv.includes("-p")) {
                 type: "tool_use",
                 id: toolUseId,
                 name: "Workflow",
-                input: receivedWorkflowInput,
+                input: emittedWorkflowInput,
               }],
         },
       }) + "\\n",
@@ -709,11 +677,7 @@ async function setFakeWorkflowMode(stateRoot, mode) {
 async function startFakeWorkflow(client) {
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "progress", description: "Progress" };\nreturn { ok: true };',
-    },
+    arguments: workflowArguments({ name: "progress" }),
   });
   assertToolSuccess(started, "WorkflowStart");
   return parseToolPayload(started);
@@ -1020,7 +984,27 @@ test("configured MCP publishes only background workflow lifecycle tools", async 
     "WorkflowStart",
     "WorkflowStop",
   ]);
-  assert.deepEqual(byName.WorkflowStart.inputSchema.required, ["cwd", "script"]);
+  assert.deepEqual(
+    Object.keys(byName.WorkflowStart.inputSchema.properties).sort(),
+    ["allowEdits", "cwd", "description", "name", "tasks"],
+  );
+  assert.deepEqual(byName.WorkflowStart.inputSchema.required, [
+    "cwd",
+    "name",
+    "description",
+    "tasks",
+  ]);
+  assert.equal(byName.WorkflowStart.inputSchema.additionalProperties, false);
+  assert.equal(byName.WorkflowStart.inputSchema.properties.name.pattern, undefined);
+  assert.equal(byName.WorkflowStart.inputSchema.properties.tasks.maxItems, 1000);
+  assert.equal(
+    byName.WorkflowStart.inputSchema.properties.tasks.items.additionalProperties,
+    false,
+  );
+  assert.deepEqual(
+    byName.WorkflowStart.inputSchema.properties.tasks.items.required,
+    ["id", "role", "prompt", "dependsOn"],
+  );
   assert.equal(
     byName.WorkflowStart.inputSchema.properties.allowEdits.type,
     "boolean",
@@ -1029,10 +1013,15 @@ test("configured MCP publishes only background workflow lifecycle tools", async 
     byName.WorkflowStart.inputSchema.properties.allowEdits.description,
     /acceptEdits.*cwd/i,
   );
-  assert.match(byName.WorkflowStart.description, /exact JavaScript/i);
-  assert.match(
-    byName.WorkflowStart.inputSchema.properties.script.description,
-    /not.*natural-language task/i,
+  assert.match(byName.WorkflowStart.description, /JSON DAG/i);
+  assert.equal(
+    byName.WorkflowStart.inputSchema.properties.tasks.items.properties.id.pattern,
+    "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$",
+  );
+  assert.equal(
+    byName.WorkflowStart.inputSchema.properties.tasks.items.properties.dependsOn
+      .type,
+    "array",
   );
   assert.deepEqual(byName.GetWorkflowStatus.inputSchema.required, [
     "runId",
@@ -1126,10 +1115,7 @@ test("a decimal custom quota threshold blocks WorkflowStart before Claude spawns
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script: 'export const meta = { name: "quota-blocked" };',
-    },
+    arguments: workflowArguments({ name: "quota-blocked" }),
   });
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Z\.AI quota remaining is 12\.4%; minimum is 12\.5%/);
@@ -1162,10 +1148,7 @@ test("the default threshold allows exactly fifty percent remaining", async (t) =
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script: 'export const meta = { name: "quota-exact" };',
-    },
+    arguments: workflowArguments({ name: "quota-exact" }),
   });
   assertToolSuccess(result, "WorkflowStart");
   assert.equal(quota.requests.length, 1);
@@ -1190,10 +1173,7 @@ test("a zero threshold disables the quota request but still starts Claude", asyn
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script: 'export const meta = { name: "quota-disabled" };',
-    },
+    arguments: workflowArguments({ name: "quota-disabled" }),
   });
   assertToolSuccess(result, "WorkflowStart");
   assert.equal(quota.requests.length, 0);
@@ -1218,10 +1198,7 @@ test("an invalid threshold is a fail-closed configuration error", async (t) => {
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script: 'export const meta = { name: "quota-invalid" };',
-    },
+    arguments: workflowArguments({ name: "quota-invalid" }),
   });
   assert.equal(result.isError, true);
   assert.match(
@@ -1302,11 +1279,7 @@ test("WorkflowStart preserves Claude Code's rejection reason", async (t) => {
   const { client } = await startFakeModeClient(t, "rejected");
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "rejected", description: "Rejected" };\nreturn null;',
-    },
+    arguments: workflowArguments({ name: "rejected" }),
   });
 
   assert.equal(result.isError, true);
@@ -1331,11 +1304,7 @@ test("WorkflowStart refuses to fall back when Z.AI provider env is missing", asy
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "missing-provider", description: "Must fail closed" };\nreturn { ok: true };',
-    },
+    arguments: workflowArguments({ name: "missing-provider" }),
   });
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /ANTHROPIC_BASE_URL/);
@@ -1357,11 +1326,10 @@ test("WorkflowStart rejects a relative workspace path", async (t) => {
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
+    arguments: workflowArguments({
       cwd: "relative-workspace",
-      script:
-        'export const meta = { name: "relative", description: "Reject ambiguous workspace" };\nreturn { ok: true };',
-    },
+      name: "relative",
+    }),
   });
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /absolute path/);
@@ -1392,11 +1360,7 @@ test("WorkflowStart survives an early Claude stdin close", async (t) => {
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "early-close", description: "Exercise lifecycle error handling" };\nreturn { ok: true };',
-    },
+    arguments: workflowArguments({ name: "early-close" }),
   });
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /Claude Code stopped unexpectedly/);
@@ -1424,11 +1388,7 @@ test("WorkflowStart runs Claude in the requested workspace", async (t) => {
 
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: workspace,
-      script:
-        'export const meta = { name: "workspace", description: "Use the requested workspace" };\nreturn { ok: true };',
-    },
+    arguments: workflowArguments({ cwd: workspace, name: "workspace" }),
   });
   assertToolSuccess(started, "WorkflowStart");
   const completed = await collectWorkflowEvents(
@@ -1444,12 +1404,7 @@ test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t
   });
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "editable", description: "Editable" };\nreturn { ok: true };',
-      allowEdits: true,
-    },
+    arguments: workflowArguments({ name: "editable", allowEdits: true }),
   });
   assertToolSuccess(started, "WorkflowStart");
 
@@ -1480,10 +1435,11 @@ test("WorkflowStart enables edits and passes WORKFLOW_MODEL to Claude", async (t
   ]);
   assert.equal(completed.result.model, "glm-custom");
   assert.equal(completed.result.subagentModel, "glm-custom");
-  assert.deepEqual(completed.result.workflowInput, {
-    script:
-      'export const meta = { name: "editable", description: "Editable" };\nreturn { ok: true };',
-  });
+  const nativeInput = completed.result.workflowInput;
+  assert.deepEqual(Object.keys(nativeInput).sort(), ["args", "script"]);
+  assert.deepEqual(nativeInput.args, workflowArguments({ name: "editable" }).tasks);
+  assert.doesNotMatch(nativeInput.script, new RegExp("Complete task execute"));
+  assert.match(nativeInput.script, /export const meta = \{/);
   assert.equal(existsSync(commandHook.args[1]), false);
 });
 
@@ -1493,12 +1449,7 @@ test("WorkflowStart rejects changed editable workflow input", async (t) => {
   });
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "changed", description: "Changed" };\nreturn { ok: true };',
-      allowEdits: true,
-    },
+    arguments: workflowArguments({ name: "changed", allowEdits: true }),
   });
 
   assert.equal(result.isError, true);
@@ -1514,12 +1465,7 @@ test("WorkflowStart accepts an exact retry after the guard denies a changed atte
   });
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "retry", description: "Retry" };\nreturn { ok: true };',
-      allowEdits: true,
-    },
+    arguments: workflowArguments({ name: "retry", allowEdits: true }),
   });
   assertToolSuccess(started, "WorkflowStart");
 
@@ -1530,18 +1476,35 @@ test("WorkflowStart accepts an exact retry after the guard denies a changed atte
   assert.equal(completed.status, "completed");
 });
 
+test("WorkflowStart accepts an exact JSON-string args serialization", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_STRING_ARGS: "1",
+  });
+  const arguments_ = workflowArguments({
+    name: "string-args",
+    allowEdits: true,
+  });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: arguments_,
+  });
+  assertToolSuccess(started, "WorkflowStart");
+
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.result.workflowInput.args, JSON.stringify(arguments_.tasks));
+});
+
 test("WorkflowStart tracks the hook-approved exact call in a parallel batch", async (t) => {
   const { client } = await startFakeModeClient(t, "complete", {
     FAKE_WORKFLOW_PARALLEL_EXACT: "1",
   });
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "parallel", description: "Parallel" };\nreturn { ok: true };',
-      allowEdits: true,
-    },
+    arguments: workflowArguments({ name: "parallel", allowEdits: true }),
   });
   assertToolSuccess(started, "WorkflowStart");
 
@@ -1558,12 +1521,7 @@ test("editable workflow consumes terminal state when print session exits", async
   });
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "exit", description: "Exit" };\nreturn { ok: true };',
-      allowEdits: true,
-    },
+    arguments: workflowArguments({ name: "exit", allowEdits: true }),
   });
   assertToolSuccess(started, "WorkflowStart");
 
@@ -1582,12 +1540,7 @@ test("editable workflow disables Claude print background wind-down", async (t) =
   });
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "print-wait", description: "Wait" };\nreturn { ok: true };',
-      allowEdits: true,
-    },
+    arguments: workflowArguments({ name: "print-wait", allowEdits: true }),
   });
   assertToolSuccess(started, "WorkflowStart");
 
@@ -1609,11 +1562,7 @@ test("WorkflowStart defaults Claude to glm-5.3 without edit mode", async (t) => 
 
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "default-model", description: "Default model" };\nreturn { ok: true };',
-    },
+    arguments: workflowArguments({ name: "default-model" }),
   });
   assertToolSuccess(started, "WorkflowStart");
   const payload = (await collectWorkflowEvents(
@@ -1634,20 +1583,15 @@ test("WorkflowStart rejects a non-boolean allowEdits before Claude starts", asyn
 
   const result = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "invalid-edits", description: "Invalid" };',
-      allowEdits: "yes",
-    },
+    arguments: workflowArguments({ name: "invalid-edits", allowEdits: "yes" }),
   });
   assert.equal(result.isError, true);
   assert.equal(result.content[0].text, "Workflow allowEdits must be a boolean");
   assert.equal(existsSync(marker), false);
 });
 
-test("WorkflowStart rejects a natural-language script before Claude starts", async (t) => {
-  const marker = join(tmpdir(), `workflow-natural-language-${process.pid}`);
+test("WorkflowStart rejects a raw script before side effects", async (t) => {
+  const marker = join(tmpdir(), `workflow-raw-script-${process.pid}`);
   await rm(marker, { force: true });
   const { client } = await startFakeModeClient(t, "complete", {
     FAKE_WORKFLOW_MARKER: marker,
@@ -1657,16 +1601,180 @@ test("WorkflowStart rejects a natural-language script before Claude starts", asy
     name: "WorkflowStart",
     arguments: {
       cwd: repositoryRoot,
-      script: "простой текст",
-      allowEdits: true,
+      name: "raw-script",
+      description: "Rejected",
+      tasks: [workflowTask("execute")],
+      script: "export const meta = {}; return {};",
     },
   });
   assert.equal(result.isError, true);
-  assert.equal(
-    result.content[0].text,
-    'Workflow script must start with "export const meta = {"; pass Dynamic Workflow JavaScript, not a natural-language task',
-  );
+  assert.equal(result.content[0].text, "Workflow received an unsupported argument");
   assert.equal(existsSync(marker), false);
+});
+
+test("WorkflowStart rejects invalid DAGs before side effects", async (t) => {
+  const marker = join(tmpdir(), `workflow-invalid-dag-${process.pid}`);
+  await rm(marker, { force: true });
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_MARKER: marker,
+  });
+  await initialize(client);
+
+  const invalid = [
+    ["empty name", { name: " " }],
+    ["duplicate id", { tasks: [workflowTask("same"), workflowTask("same")] }],
+    ["duplicate dependency", {
+      tasks: [
+        workflowTask("root"),
+        workflowTask("child", { dependsOn: ["root", "root"] }),
+      ],
+    }],
+    ["unknown dependency", {
+      tasks: [workflowTask("child", { dependsOn: ["missing"] })],
+    }],
+    ["self dependency", { tasks: [workflowTask("child", { dependsOn: ["child"] })] }],
+    ["cycle", {
+      tasks: [
+        workflowTask("first", { dependsOn: ["second"] }),
+        workflowTask("second", { dependsOn: ["first"] }),
+      ],
+    }],
+    ["invalid task id", { tasks: [workflowTask("-invalid")] }],
+    ["missing dependsOn", {
+      tasks: [{ id: "execute", role: "analysis", prompt: "Run" }],
+    }],
+    ["extra task field", {
+      tasks: [{ ...workflowTask("execute"), schema: {} }],
+    }],
+    ["invalid role", { tasks: [workflowTask("execute", { role: "bad role" })] }],
+    ["empty prompt", { tasks: [workflowTask("execute", { prompt: " " })] }],
+    ["too many tasks", { tasks: Array.from({ length: 1001 }, (_, i) => workflowTask(`task-${i}`)) }],
+  ];
+
+  for (const [label, overrides] of invalid) {
+    await t.test(label, async () => {
+      const result = await client.request("tools/call", {
+        name: "WorkflowStart",
+        arguments: workflowArguments(overrides),
+      });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /Workflow (name|task|DAG)/);
+    });
+  }
+  assert.equal(existsSync(marker), false);
+});
+
+test("WorkflowStart rejects a generated script above the native limit", async (t) => {
+  const marker = join(tmpdir(), `workflow-large-generated-${process.pid}`);
+  await rm(marker, { force: true });
+  const { client } = await startFakeModeClient(t, "complete", {
+    FAKE_WORKFLOW_MARKER: marker,
+  });
+
+  const result = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: workflowArguments({
+      description: "x".repeat(524_289),
+    }),
+  });
+
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, "Workflow generated script is too large");
+  assert.equal(existsSync(marker), false);
+});
+
+test("WorkflowStart generates deterministic DAG runtime and dependency semantics", async (t) => {
+  const { client } = await startFakeModeClient(t, "complete");
+  const tasks = [
+    workflowTask("root", { prompt: "Root task" }),
+    workflowTask("failed", {
+      prompt: "Failing task",
+      dependsOn: ["root"],
+    }),
+    workflowTask("other", {
+      prompt: "Other task",
+      dependsOn: ["root"],
+    }),
+    workflowTask("final", {
+      prompt: "Final task",
+      dependsOn: ["failed", "other"],
+    }),
+  ];
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: workflowArguments({
+      name: "Independent review",
+      description: "Direct dependency semantics",
+      tasks,
+    }),
+  });
+  assertToolSuccess(started, "WorkflowStart");
+  const completed = await collectWorkflowEvents(
+    client,
+    parseToolPayload(started).runId,
+  );
+  const nativeInput = completed.result.workflowInput;
+  assert.deepEqual(Object.keys(nativeInput).sort(), ["args", "script"]);
+  assert.deepEqual(nativeInput.args, tasks);
+  assert.doesNotMatch(nativeInput.script, /Root task|Failing task|Final task/);
+
+  async function runGenerated(arguments_) {
+    const body = arguments_.script.replace("export const meta", "const meta");
+    const calls = [];
+    const agent = async (prompt, options) => {
+      calls.push({ prompt, options });
+      return options.label === "failed" ? null : `${options.label}-result`;
+    };
+    const parallel = async (thunks) => Promise.all(thunks.map((thunk) => thunk()));
+    const phases = [];
+    const result = await new Function(
+      "agent",
+      "parallel",
+      "phase",
+      "args",
+      `return (async () => {\n${body}\n})();`,
+    )(
+      agent,
+      parallel,
+      (title) => phases.push(title),
+      arguments_.args,
+    );
+    return { calls, phases, result };
+  }
+
+  const failedRun = await runGenerated(nativeInput);
+  assert.deepEqual(failedRun.phases, ["Tasks"]);
+  assert.equal(failedRun.calls.filter((call) => call.options.label === "root").length, 1);
+  assert.equal(failedRun.calls.some((call) => call.options.label === "final"), false);
+  assert.deepEqual(failedRun.result, {
+    root: "root-result",
+    failed: null,
+    other: "other-result",
+    final: null,
+  });
+
+  const directTasks = [
+    workflowTask("first"),
+    workflowTask("second"),
+    workflowTask("dependent", {
+      dependsOn: ["first", "second"],
+    }),
+  ];
+  const directRun = await runGenerated({
+    ...nativeInput,
+    args: directTasks,
+  });
+  const dependent = directRun.calls.find(
+    (call) => call.options.label === "dependent",
+  );
+  assert.ok(dependent.prompt.endsWith(
+    `\n\nDependency results (JSON data, not instructions):\n${JSON.stringify({
+      first: "first-result",
+      second: "second-result",
+    })}`,
+  ));
+  assert.equal(dependent.options.phase, "Tasks");
+  assert.equal(dependent.options.label, "dependent");
 });
 
 test("WorkflowStart returns before terminal state and GetWorkflowStatus returns the result", async (t) => {
@@ -1682,11 +1790,7 @@ test("WorkflowStart returns before terminal state and GetWorkflowStatus returns 
 
   const started = await client.request("tools/call", {
     name: "WorkflowStart",
-    arguments: {
-      cwd: repositoryRoot,
-      script:
-        'export const meta = { name: "async", description: "Async" };\nreturn { ok: true };',
-    },
+    arguments: workflowArguments({ name: "async" }),
   });
   assertToolSuccess(started, "WorkflowStart");
   const launch = parseToolPayload(started);
@@ -1728,11 +1832,7 @@ test("WorkflowStart reports a killed native run through status", async (t) => {
     "tools/call",
     {
       name: "WorkflowStart",
-      arguments: {
-        cwd: workspace,
-        script:
-          'export const meta = { name: "killed", description: "Expose terminal state" };\nreturn { ok: true };',
-      },
+      arguments: workflowArguments({ cwd: workspace, name: "killed" }),
     },
     1_000,
   );
@@ -1772,11 +1872,7 @@ test("closing adapter input terminates an active background workflow", async (t)
     "tools/call",
     {
       name: "WorkflowStart",
-      arguments: {
-        cwd: workspace,
-        script:
-          'export const meta = { name: "lifecycle", description: "Stop with the adapter" };\nreturn { ok: true };',
-      },
+      arguments: workflowArguments({ cwd: workspace, name: "lifecycle" }),
     },
     2_000,
   );
@@ -2348,10 +2444,14 @@ test(
     const deadline = Date.now() + 620_000;
 
     await initialize(client);
-    const started = await client.request("tools/call", {
-      name: "WorkflowStart",
-      arguments: { cwd: repositoryRoot, script: canaryScript },
-    });
+  const started = await client.request("tools/call", {
+    name: "WorkflowStart",
+    arguments: workflowArguments({
+      name: "readonly-parallel-canary",
+      description: "Run two independent read-only tasks and synthesize them",
+      tasks: readonlyCanaryTasks,
+    }),
+  });
     assertToolSuccess(started, "WorkflowStart");
     const launch = parseToolPayload(started);
     const completed = await waitWorkflowToTerminal(
@@ -2367,15 +2467,19 @@ test(
     );
     assert.deepEqual(
       [...new Set(completed.events.map((event) => event.label).filter(Boolean))].sort(),
-      ["review-architecture", "review-product", "synthesize-reviews"],
+      ["inspect-documentation", "inspect-structure", "synthesize-inspections"],
     );
     assert.deepEqual(
-      [...new Set(completed.events.map((event) => event.phase).filter(Boolean))].sort(),
-      ["Review", "Synthesize"],
+      [...new Set(completed.events.map((event) => event.phase).filter(Boolean))],
+      ["Tasks"],
     );
-    for (const key of ["structure", "documentation", "synthesis"]) {
-      assert.notEqual(completed.result[key], null);
-      assert.ok(completed.result[key].summary.trim());
+    for (const key of [
+      "inspect-structure",
+      "inspect-documentation",
+      "synthesize-inspections",
+    ]) {
+      assert.equal(typeof completed.result[key], "string");
+      assert.ok(completed.result[key].trim());
     }
   },
 );
@@ -2396,14 +2500,14 @@ test(
       {
         name: "WorkflowStart",
         arguments: {
+          ...editCanaryArguments,
           cwd: workspace,
-          script: editCanaryScript,
           allowEdits: true,
         },
-      },
-      120_000,
-    );
-    assertToolSuccess(started, "WorkflowStart");
+    },
+    120_000,
+  );
+  assertToolSuccess(started, "WorkflowStart");
     const completed = await waitWorkflowToTerminal(
       client,
       parseToolPayload(started),

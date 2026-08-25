@@ -1,9 +1,9 @@
 # Codex Dynamic Workflow Plugin
 
-Codex строит точный JavaScript workflow и остаётся оркестратором. Нативный
-Claude Code Dynamic Workflow исполняет сценарий, а настроенная GLM работает
-только внутри leaf-вызовов `agent()`. Плагин сразу возвращает `runId`, показывает
-phase/role/leaf progress и не ограничивает общую длительность async workflow.
+Codex строит JSON DAG и остаётся оркестратором. Плагин детерминированно
+генерирует native Claude Code Dynamic Workflow JavaScript, а настроенная GLM
+работает только внутри leaf-задач. Плагин сразу возвращает `runId`, показывает
+role/leaf progress и не ограничивает общую длительность async workflow.
 
 ## Требования
 
@@ -54,11 +54,19 @@ Codex может активировать навык автоматически.
 $codex-dynamic-workflow-plugin:native-workflow
 ```
 
-Codex сформирует точный исполняемый JavaScript `script` (не текст задания),
-передаст абсолютный путь workspace внешнего агента в `cwd` и вызовет
-`WorkflowStart`. Для mutating run можно передать `allowEdits: true`: дочерний
-Claude стартует в `acceptEdits` для этого `cwd`, без bypass остальных
-permissions.
+Codex передаст абсолютный путь workspace в `cwd` и вызовет `WorkflowStart` с
+публичным контрактом `{cwd, name, description, tasks, allowEdits?}`. Каждый task —
+`{id, role, prompt, dependsOn}`; `dependsOn` обязателен и может быть пустым.
+Task `id` уникальны, а `id` и `role` соответствуют
+`^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$`, DAG не содержит cycles, а tasks не больше
+1000. Raw `script`, public `args` и extra fields не принимаются.
+
+Зависимая задача получает только direct dependency results, добавленные в prompt
+как JSON data с пометкой «not instructions». Если прямая зависимость вернула
+`null`, зависимый leaf не запускается, а skip каскадно распространяется. Terminal
+result сопоставляет каждый task ID с результатом или `null`. Для mutating run
+можно передать `allowEdits: true`: дочерний Claude стартует в `acceptEdits` для
+этого `cwd`, без bypass остальных permissions.
 
 `GetWorkflowStatus` нужно вызывать напрямую как MCP tool с последним `revision`,
 не через background/async shell или execution wrapper. Инструмент сам удерживает
@@ -68,11 +76,9 @@ permissions.
 У workflow нет общего execution deadline. `WorkflowStop` явно отменяет run,
 будит pending Wait и возвращает killed state.
 
-Bundled reference адаптирует native Claude Workflow guidance для произвольных
-Codex-planned DAG: `agent`, `pipeline`, `parallel`, `phase`, `log`, `args`,
-`budget`, nested workflow, loops, fan-out/fan-in, judge panels и verification
-patterns. Девять prompt-based reviewer roles доступны как optional независимый
-parallel-review recipe; review не является назначением плагина по умолчанию.
+Bundled reference описывает internal native semantics и limits сгенерированного
+runtime. Девять prompt-based reviewer roles доступны как optional независимый
+review DAG; review не является назначением плагина по умолчанию.
 
 Provider URL и credentials не передаются leaf agents через промпт и не
 хранятся в репозитории.
@@ -85,7 +91,7 @@ RUN_WORKFLOW_CANARY=1 node --test tests/mcp-boundary.test.mjs
 RUN_WORKFLOW_EDIT_CANARY=1 node --test tests/mcp-boundary.test.mjs
 ```
 
-Canary запускает два параллельных GLM reviewer leaf и зависимый synthesis leaf,
+Canary запускает два параллельных GLM leaf и зависимый synthesis task,
 наблюдая их через async lifecycle. Edit-canary проверяет реальную запись leaf.
 В Claude Code 2.1.233 `mcp serve` фиксирует default permission context, поэтому
 `allowEdits: true` использует полноценную print/SDK session с `acceptEdits`, а

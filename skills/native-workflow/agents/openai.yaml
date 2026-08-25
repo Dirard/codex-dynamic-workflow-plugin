@@ -1,7 +1,7 @@
 interface:
   display_name: "Native Workflow"
   short_description: "Запуск workflow, спланированных Codex"
-  default_prompt: "Use $codex-dynamic-workflow-plugin:native-workflow to execute this task as an exact Codex-planned workflow."
+  default_prompt: "Use $codex-dynamic-workflow-plugin:native-workflow to execute this task as a Codex-planned JSON DAG."
 
 dependencies:
   tools:
